@@ -161,6 +161,12 @@ scripts/             init_db, run_demo, run_generations, poison_demo
 tests/               concurrent-contradiction tests
 ```
 
+## Deploying on AWS
+
+Full walkthrough in [docs/DEPLOY.md](docs/DEPLOY.md): CockroachDB cluster via
+ccloud CLI, Bedrock model access, dashboard → App Runner, Gardener → Lambda +
+EventBridge (both as container images from their Dockerfiles).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

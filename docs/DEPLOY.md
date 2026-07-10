@@ -17,6 +17,34 @@ cluster and Bedrock in the same region to minimize latency.
 
 ---
 
+## Fast path: one command with CDK ⚡
+
+Steps 3–5 below are fully automated by the CDK app in `infra/` — it builds
+both Docker images, pushes them to ECR, and stands up the Lambda, the
+EventBridge schedule, and the App Runner service:
+
+```powershell
+npm install -g aws-cdk          # the CDK CLI (once)
+cd infra
+pip install -r requirements.txt
+cdk bootstrap                   # once per account/region
+$env:DATABASE_URL = "<your-crdb-url>"
+cdk deploy
+```
+
+The stack outputs `DashboardUrl` (your public demo link) and the Gardener's
+function name. Redeploy after code changes with another `cdk deploy` — CDK
+rebuilds only what changed. Tear everything down with `cdk destroy`.
+
+Still manual, by nature: **step 1** (the CockroachDB cluster, via ccloud CLI)
+and **step 2** (Bedrock model access — an account-level opt-in). Do those two,
+then `cdk deploy`, and skip to the checklist.
+
+The sections below are the manual equivalent — useful for understanding
+what the stack creates, or if you'd rather not use CDK.
+
+---
+
 ## 1. CockroachDB Cloud cluster (via ccloud CLI)
 
 ```powershell

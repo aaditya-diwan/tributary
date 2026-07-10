@@ -9,3 +9,5 @@ dist/
 build/
 .idea/
 .vscode/
+infra/cdk.out/
+

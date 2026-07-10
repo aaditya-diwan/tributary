@@ -163,9 +163,16 @@ tests/               concurrent-contradiction tests
 
 ## Deploying on AWS
 
-Full walkthrough in [docs/DEPLOY.md](docs/DEPLOY.md): CockroachDB cluster via
-ccloud CLI, Bedrock model access, dashboard → App Runner, Gardener → Lambda +
-EventBridge (both as container images from their Dockerfiles).
+One command, via the CDK app in `infra/` (builds and pushes both container
+images, stands up Lambda + EventBridge + App Runner):
+
+```powershell
+cd infra && pip install -r requirements.txt && cdk bootstrap
+$env:DATABASE_URL = "<your-crdb-url>"; cdk deploy   # outputs the dashboard URL
+```
+
+Full walkthrough (cluster via ccloud CLI, Bedrock model access, manual
+equivalents) in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## License
 

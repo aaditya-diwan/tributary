@@ -1,0 +1,11 @@
+# Keeps Docker build contexts (and CDK asset staging) small — without this,
+# CDK stages .venv/.git into cdk.out and synth takes forever.
+.venv
+.git
+.env
+infra
+docs
+tests
+.pytest_cache
+**/__pycache__
+*.egg-info

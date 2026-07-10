@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
+mcp = ["mcp>=1.6"]
 dev = ["pytest>=8.0"]
 
 [build-system]

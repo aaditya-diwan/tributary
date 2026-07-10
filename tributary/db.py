@@ -44,6 +44,19 @@ def run_txn(fn, retries: int = MAX_RETRIES):
     raise last_err
 
 
+def run_readonly(sql: str, params=()) -> list[tuple]:
+    """Run a single read-only statement on an autocommit connection.
+
+    AS OF SYSTEM TIME queries must run outside an explicit transaction,
+    so time-travel reads go through here rather than run_txn.
+    """
+    with connect() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+
 def vec_literal(embedding: list[float]) -> str:
     """Render an embedding as a CockroachDB VECTOR literal string."""
     return "[" + ",".join(f"{x:.7g}" for x in embedding) + "]"

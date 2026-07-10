@@ -12,14 +12,15 @@ import json
 import re
 import time
 
-from tributary import llm, memory
+from tributary import llm, memory, runs
 from agents import prompts
 from gauntlet import Gauntlet
 
 MAX_STEPS = 25
 
 
-def run_agent(agent_name: str, task: str, use_memory: bool = True) -> dict:
+def run_agent(agent_name: str, task: str, use_memory: bool = True,
+              generation: int | None = None) -> dict:
     agent_id = memory.ensure_agent(agent_name)
     env = Gauntlet()
 
@@ -83,6 +84,8 @@ def run_agent(agent_name: str, task: str, use_memory: bool = True) -> dict:
              "seconds": round(elapsed, 1), "tokens": tokens["input"] + tokens["output"],
              "recalled": len(recalled)}
     print(f"    {outcome} in {env.steps} steps, {stats['tokens']} tokens, {elapsed:.1f}s")
+    runs.log_run(agent_name, task, outcome, env.steps, stats["tokens"],
+                 elapsed, len(recalled), generation=generation)
 
     # --- distill new lessons and write them to the tribe ---
     if use_memory and env.transcript:

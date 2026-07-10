@@ -30,6 +30,20 @@ CREATE VECTOR INDEX IF NOT EXISTS lessons_embedding_idx ON lessons (embedding);
 
 CREATE INDEX IF NOT EXISTS lessons_status_idx ON lessons (status, confidence);
 
+-- Benchmark runs, for the generational learning curve.
+CREATE TABLE IF NOT EXISTS runs (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_name       STRING NOT NULL,
+    generation       INT,
+    task             STRING,
+    outcome          STRING,
+    steps            INT,
+    tokens           INT,
+    seconds          FLOAT,
+    lessons_recalled INT,
+    at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS memory_audit (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     agent_id   UUID,

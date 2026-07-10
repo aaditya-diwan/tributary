@@ -7,6 +7,7 @@ Deployed on AWS App Runner via dashboard/Dockerfile.
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
+from tributary import memory, runs
 from tributary.db import run_txn
 
 app = FastAPI(title="Tributary")
@@ -28,6 +29,24 @@ def feed(limit: int = 50):
         return [{"at": str(r[0]), "agent": r[1], "action": r[2],
                  "lesson_id": r[3], "detail": r[4]} for r in cur.fetchall()]
     return run_txn(txn)
+
+
+@app.get("/api/lessons_as_of")
+def lessons_as_of(ts: str):
+    """Time-travel: the tribe's belief set at a past instant, via
+    CockroachDB AS OF SYSTEM TIME."""
+    try:
+        found = memory.lessons_as_of(ts)
+    except ValueError:
+        return {"error": f"bad timestamp: {ts}"}
+    return [{"id": l.id, "situation": l.situation, "content": l.content,
+             "confidence": l.confidence, "times_helpful": l.times_helpful,
+             "created_at": l.created_at} for l in found]
+
+
+@app.get("/api/runs")
+def api_runs():
+    return runs.list_runs()
 
 
 @app.get("/api/lessons")
@@ -93,8 +112,47 @@ PAGE = """<!doctype html><html><head><title>Tributary</title>
 <div class="grid">
   <div class="card"><h2>Live memory feed</h2><div id="feed"></div></div>
   <div class="card"><h2>Active lessons</h2><div id="lessons"></div></div>
+  <div class="card"><h2>The species gets smarter — tokens per generation</h2>
+    <svg id="curve" viewBox="0 0 400 150" style="width:100%"></svg></div>
+  <div class="card"><h2>🕰️ Time travel — what did the tribe believe at…</h2>
+    <input type="datetime-local" id="ts" step="1"
+      style="background:#1c2c48;color:#dbe4f0;border:1px solid #2a3c5c;border-radius:6px;padding:6px">
+    <button onclick="travel()"
+      style="background:#57b3ff;color:#0b1220;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font-weight:600">
+      Look</button>
+    <div class="sub" style="margin-top:6px">Powered by CockroachDB AS OF SYSTEM TIME — no snapshots, just SQL.</div>
+    <div id="past"></div></div>
 </div>
 <script>
+function lessonHtml(l){
+  return `<div class="item lesson"><div class=sit>When ${l.situation}</div>${l.content}`+
+    `<span class=badge>conf ${l.confidence.toFixed(2)}</span></div>`;
+}
+async function travel(){
+  const ts = document.getElementById('ts').value;
+  if(!ts) return;
+  const past = await fetch('/api/lessons_as_of?ts='+encodeURIComponent(ts)).then(r=>r.json());
+  document.getElementById('past').innerHTML = past.error ? past.error :
+    (past.length ? past.map(lessonHtml).join('') :
+     '<div class=item>The tribe knew nothing yet.</div>');
+}
+async function drawCurve(){
+  const rs = await fetch('/api/runs').then(r=>r.json());
+  const gens = {};
+  rs.filter(r=>r.generation).forEach(r=>{(gens[r.generation]=gens[r.generation]||[]).push(r.tokens)});
+  const pts = Object.keys(gens).sort((a,b)=>a-b)
+    .map(g=>[+g, gens[g].reduce((s,x)=>s+x,0)/gens[g].length]);
+  if(pts.length<2){document.getElementById('curve').innerHTML=
+    '<text x=10 y=30 fill="#7d8ca3" font-size=12>Run scripts/run_generations.py to draw the curve</text>';return;}
+  const maxT=Math.max(...pts.map(p=>p[1])), maxG=Math.max(...pts.map(p=>p[0]));
+  const X=g=>20+(g-1)*(360/Math.max(maxG-1,1)), Y=t=>135-(t/maxT)*115;
+  const line=pts.map((p,i)=>`${i?'L':'M'}${X(p[0])},${Y(p[1])}`).join(' ');
+  document.getElementById('curve').innerHTML =
+    `<path d="${line}" fill="none" stroke="#57b3ff" stroke-width="2"/>`+
+    pts.map(p=>`<circle cx=${X(p[0])} cy=${Y(p[1])} r=3 fill="#ffb454"/>`+
+      `<text x=${X(p[0])-8} y=148 fill="#7d8ca3" font-size=9>g${p[0]}</text>`).join('');
+}
+
 async function tick(){
   const [feed, lessons, stats] = await Promise.all([
     fetch('/api/feed').then(r=>r.json()),
@@ -113,7 +171,7 @@ async function tick(){
     `<span class=badge>by ${l.learned_by}</span><span class=badge>conf ${l.confidence.toFixed(2)}</span>`+
     `<span class=badge>helped ${l.times_helpful}x</span></div>`).join('');
 }
-tick(); setInterval(tick, 3000);
+tick(); drawCurve(); setInterval(tick, 3000); setInterval(drawCurve, 10000);
 </script></body></html>"""
 
 

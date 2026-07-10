@@ -5,6 +5,24 @@ CockroachDB. Agents are born knowing what the tribe knows, and die leaving
 the tribe smarter.
 """
 
-from tributary.memory import Lesson, ensure_agent, learn, recall, reinforce, retire
+from tributary.memory import (
+    Lesson,
+    ensure_agent,
+    learn,
+    lessons_as_of,
+    recall,
+    recall_as_of,
+    reinforce,
+    retire,
+)
 
-__all__ = ["Lesson", "ensure_agent", "learn", "recall", "reinforce", "retire"]
+__all__ = [
+    "Lesson",
+    "ensure_agent",
+    "learn",
+    "lessons_as_of",
+    "recall",
+    "recall_as_of",
+    "reinforce",
+    "retire",
+]

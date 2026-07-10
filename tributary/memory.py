@@ -8,9 +8,10 @@ database underneath it.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from tributary import llm
-from tributary.db import run_txn, vec_literal
+from tributary.db import run_readonly, run_txn, vec_literal
 from tributary.embeddings import embed
 
 # Cosine distance below which an existing lesson is "similar enough" to be a
@@ -94,6 +95,49 @@ def recall(query: str, agent_id: str | None = None, k: int = 5,
         return [Lesson.from_row(r) for r in rows]
 
     return run_txn(txn)
+
+
+def _as_of_clause(timestamp: str | datetime) -> str:
+    """Validate a timestamp and render an AS OF SYSTEM TIME clause.
+
+    CockroachDB can read any table as it existed at a past instant — no
+    snapshots, no extra tables. Tributary uses it for time-travel memory:
+    "what did the tribe believe at 3:42pm yesterday?"
+    """
+    ts = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(timestamp)
+    return f"AS OF SYSTEM TIME '{ts.isoformat()}'"
+
+
+def recall_as_of(query: str, timestamp: str | datetime, k: int = 5) -> list[Lesson]:
+    """What would recall() have returned at `timestamp`? Read-only; leaves
+    no trace in usage counters — this is forensics, not memory access."""
+    qvec = vec_literal(embed(query))
+    rows = run_readonly(
+        f"""
+        SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
+        FROM lessons {_as_of_clause(timestamp)}
+        WHERE status = 'active'
+        ORDER BY embedding <=> %s::VECTOR
+        LIMIT %s
+        """,
+        (qvec, qvec, k),
+    )
+    return [Lesson.from_row(r) for r in rows]
+
+
+def lessons_as_of(timestamp: str | datetime, limit: int = 200) -> list[Lesson]:
+    """The tribe's full active belief set as it existed at `timestamp`."""
+    rows = run_readonly(
+        f"""
+        SELECT {_LESSON_COLS}
+        FROM lessons {_as_of_clause(timestamp)}
+        WHERE status = 'active'
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return [Lesson.from_row(r) for r in rows]
 
 
 def learn(content: str, situation: str, agent_id: str, evidence: str = "",

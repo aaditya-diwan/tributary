@@ -1,0 +1,23 @@
+[project]
+name = "tributary"
+version = "0.1.0"
+description = "Shared, persistent, conflict-safe memory for AI agents on CockroachDB + AWS Bedrock"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "boto3>=1.34",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tributary"]

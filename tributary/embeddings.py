@@ -1,43 +1,33 @@
-"""Embeddings via Amazon Bedrock (Titan Text Embeddings V2).
+"""Embeddings via a local sentence-transformers model — no AWS, no network.
 
 Offline mode (TRIBUTARY_OFFLINE=1) produces deterministic bag-of-words hash
-embeddings so the memory layer and tests run without AWS credentials —
+embeddings so the memory layer and tests run without downloading a model —
 similar texts still land near each other.
 """
 
 import hashlib
-import json
 import math
 import re
 
 from tributary import config
 
-_client = None
+_model = None
 
 
-def _bedrock():
-    global _client
-    if _client is None:
-        import boto3
+def _local_model():
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
 
-        _client = boto3.client("bedrock-runtime", region_name=config.AWS_REGION)
-    return _client
+        _model = SentenceTransformer(config.EMBED_MODEL_ID)
+    return _model
 
 
 def embed(text: str) -> list[float]:
     if config.OFFLINE:
         return _fake_embed(text)
-    resp = _bedrock().invoke_model(
-        modelId=config.BEDROCK_EMBED_MODEL_ID,
-        body=json.dumps(
-            {
-                "inputText": text[:8000],
-                "dimensions": config.EMBED_DIMENSIONS,
-                "normalize": True,
-            }
-        ),
-    )
-    return json.loads(resp["body"].read())["embedding"]
+    vec = _local_model().encode(text[:8000], normalize_embeddings=True)
+    return vec.tolist()
 
 
 def _fake_embed(text: str) -> list[float]:

@@ -10,8 +10,8 @@ both Docker images built and pushed automatically by CDK asset bundling.
     $env:DATABASE_URL = "<crdb-url>"     # PowerShell (export ... on bash)
     cdk deploy
 
-Not automatable here: Bedrock model access (account-level opt-in in the
-console) and the CockroachDB cluster itself (ccloud CLI — see docs/DEPLOY.md).
+Not automatable here: the CockroachDB cluster itself (ccloud CLI — see
+docs/DEPLOY.md).
 
 Note: DATABASE_URL lands as a plain environment variable on both services,
 which is fine for a hackathon; the production path is Secrets Manager.

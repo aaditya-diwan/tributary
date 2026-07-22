@@ -21,10 +21,11 @@ class Gauntlet:
         self.build_ok = False
         self.deployed_db_url = None
         self.deployed = False
+        self.rate_limited = 0
         self.steps = 0
         self.transcript: list[dict] = []
 
-    # ---- tool schemas (Bedrock Converse toolSpec format) ----
+    # ---- tool schemas (Converse-style toolSpec format) ----
     TOOLS = [
         {"toolSpec": {
             "name": "run_build",
@@ -88,14 +89,20 @@ class Gauntlet:
                 return ""  # silently deprecated — the classic trap
             if key == "db_url_v2":
                 return "postgres://payments:****@db.internal:26257/payments"
-            return f"ERROR: unknown config key '{key}'"
+            return (f"ERROR: unknown config key '{key}'. Available keys: "
+                    "build_flags, db_url, db_url_v2, deploy_region, log_level")
 
         if name == "deploy":
             if not self.build_ok:
                 return "DEPLOY FAILED: no artifact found. Run a successful build first."
             headers = args.get("headers") or {}
             if str(headers.get("X-Batch", "")).lower() != "true":
-                return "HTTP 429 Too Many Requests: rate limit exceeded. Retry later."
+                self.rate_limited += 1
+                if self.rate_limited < 2:
+                    return "HTTP 429 Too Many Requests: rate limit exceeded. Retry later."
+                return ("HTTP 429 Too Many Requests: rate limit exceeded. "
+                        "(docs: interactive deploys are rate limited; batch "
+                        "deploys with header X-Batch: true are exempt)")
             self.deployed = True
             self.deployed_db_url = args.get("db_url", "")
             return "Deploy accepted: release r-8817 rolling out."

@@ -1,19 +1,19 @@
 # Deploying Tributary on AWS
 
-Four pieces get deployed. The agents themselves run anywhere (your laptop for
-the demo, ECS if you want them cloud-resident) — what lives on AWS is the
-model layer (Bedrock), the Gardener (Lambda), and the dashboard (App Runner).
+Three pieces get deployed. The agents themselves run anywhere (your laptop for
+the demo, ECS if you want them cloud-resident) and use the headless Claude
+Code CLI for reasoning — what lives on AWS is the Gardener (Lambda) and the
+dashboard (App Runner).
 
 ```
 CockroachDB Cloud (on AWS us-east-1)  ← ccloud CLI
-Bedrock: Claude + Titan embeddings    ← model access, IAM
 Lambda + EventBridge: the Gardener    ← container image from gardener/Dockerfile
 App Runner: the dashboard             ← container image from dashboard/Dockerfile
 ```
 
 Prereqs: AWS CLI configured (`aws configure`), Docker Desktop running,
-`ccloud` installed. Everything below assumes region `us-east-1` — keep the
-cluster and Bedrock in the same region to minimize latency.
+`ccloud` installed, and Claude Code installed + logged in (for the agents).
+Everything below assumes region `us-east-1`.
 
 ---
 
@@ -36,9 +36,8 @@ The stack outputs `DashboardUrl` (your public demo link) and the Gardener's
 function name. Redeploy after code changes with another `cdk deploy` — CDK
 rebuilds only what changed. Tear everything down with `cdk destroy`.
 
-Still manual, by nature: **step 1** (the CockroachDB cluster, via ccloud CLI)
-and **step 2** (Bedrock model access — an account-level opt-in). Do those two,
-then `cdk deploy`, and skip to the checklist.
+Still manual, by nature: **step 1** (the CockroachDB cluster, via ccloud CLI).
+Do that, then `cdk deploy`, and skip to the checklist.
 
 The sections below are the manual equivalent — useful for understanding
 what the stack creates, or if you'd rather not use CDK.
@@ -68,22 +67,21 @@ python scripts/init_db.py
 - MCP Server: Cloud Console → your cluster → **MCP** → copy the config snippet
   into Claude Code (read-only mode is fine; it's for human curation).
 
-## 2. Amazon Bedrock
+## 2. The model layer (local — nothing to deploy)
 
-1. Console → Bedrock → **Model access** → request: **Anthropic Claude Sonnet 4.5**
-   and **Amazon Titan Text Embeddings V2** (usually instant).
-2. Give your local credentials (and later the agents' execution role, if you
-   move them to ECS) this policy:
+Agent reasoning and the lesson classifier run through the headless Claude
+Code CLI (`claude -p`), using whatever auth your local `claude` binary
+already has. Embeddings come from a local sentence-transformers model
+(downloaded on first use, ~1.3 GB):
 
-```json
-{ "Version": "2012-10-17",
-  "Statement": [{ "Effect": "Allow",
-    "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-    "Resource": "*" }] }
+```powershell
+pip install -e ".[embeddings]"
+claude --version        # confirm the CLI is installed and logged in
 ```
 
-3. Smoke test: `python scripts/run_demo.py` locally — this exercises Bedrock,
-   the vector index, and the whole learn/recall loop end to end.
+Smoke test: `python scripts/run_demo.py` locally — this exercises the CLI,
+the local embedder, the vector index, and the whole learn/recall loop end
+to end.
 
 ## 3. One-time: ECR login + repos
 
@@ -151,9 +149,11 @@ For the demo, running agents from your terminal is *better* — judges see them
 live, and the point is that unrelated processes share memory. If you want
 them cloud-resident anyway: build an image from the repo root that runs
 `python -m agents.runner --agent agent-a`, push to ECR, and run it as a
-Fargate task with `DATABASE_URL` in the environment and a task role that has
-the Bedrock invoke policy from step 2. Two task definitions (agent-a /
-agent-b) launched a minute apart make the same A-then-B demo, in the cloud.
+Fargate task with `DATABASE_URL` in the environment. Note the image would
+also need the Claude Code CLI installed and authenticated (e.g. a long-lived
+token from `claude setup-token`), which is another reason laptop-resident
+agents are the better demo. Two task definitions (agent-a / agent-b)
+launched a minute apart make the same A-then-B demo, in the cloud.
 
 ## Checklist before submitting
 
@@ -161,5 +161,6 @@ agent-b) launched a minute apart make the same A-then-B demo, in the cloud.
 - [ ] `aws lambda invoke` on the Gardener returns `{"decayed": N, "retired": M}`
 - [ ] MCP Server connected in Claude Code (both the managed one and `mcp_server/`)
 - [ ] `.env` is NOT committed (it's gitignored — keep it that way)
-- [ ] Architecture diagram includes: Bedrock, Lambda+EventBridge, App Runner,
-      CockroachDB Cloud, MCP, and the agents
+- [ ] Architecture diagram includes: Lambda+EventBridge, App Runner,
+      CockroachDB Cloud, MCP, the agents, and the local model layer
+      (Claude Code CLI + sentence-transformers)

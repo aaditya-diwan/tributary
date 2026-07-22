@@ -1,6 +1,6 @@
 # 🌊 Tributary
 
-**Shared, persistent, conflict-safe memory for AI agents — built on CockroachDB and AWS Bedrock.**
+**Shared, persistent, conflict-safe memory for AI agents — built on CockroachDB and AWS.**
 
 Every agent's learnings flow into one shared river of memory. When one agent learns a lesson, every agent — current or future, related or not — knows it instantly. Agents are born knowing what the tribe knows, and die leaving the tribe smarter.
 
@@ -27,7 +27,7 @@ Because every write is a serializable transaction, two agents learning contradic
 ## Architecture
 
 ```
-                     Amazon Bedrock (Claude + Titan Embeddings V2)
+              Claude Code CLI (headless)  +  local embeddings (1024-d)
                                       │
         agent-a ──┐                   │
         agent-b ──┤── tributary lib: recall() / learn()
@@ -48,8 +48,9 @@ Because every write is a serializable transaction, two agents learning contradic
 ```bash
 git clone https://github.com/aaditya-diwan/tributary && cd tributary
 python -m venv .venv && .venv/Scripts/activate   # or source .venv/bin/activate
-pip install -e ".[dashboard,dev]"
-cp .env.example .env                             # fill in DATABASE_URL + AWS creds
+pip install -e ".[embeddings,dashboard,dev]"
+cp .env.example .env                             # fill in DATABASE_URL
+# agents use the `claude` CLI for reasoning — install Claude Code and log in
 
 python scripts/init_db.py                        # create schema + vector index
 python scripts/run_demo.py                       # the A-then-B demo
@@ -132,16 +133,19 @@ TRIBUTARY_OFFLINE=1 pytest tests/ -v
 
 **CockroachDB** (hackathon requires ≥2 — we use all four):
 
-1. **Distributed Vector Indexing** — the core of `recall()`. Lessons are embedded (Titan V2, 1024-d) and stored in a `VECTOR(1024)` column with a `VECTOR INDEX`; agents retrieve tribal knowledge by semantic similarity (`<=>` cosine distance), so a paraphrased situation still finds the right lesson. Vectors live in the same transactional database as the lesson metadata — no sync gap between embeddings and truth. `AS OF SYSTEM TIME` on the same table gives time-travel recall for free.
+1. **Distributed Vector Indexing** — the core of `recall()`. Lessons are embedded (1024-d, local sentence-transformers) and stored in a `VECTOR(1024)` column with a `VECTOR INDEX`; agents retrieve tribal knowledge by semantic similarity (`<=>` cosine distance), so a paraphrased situation still finds the right lesson. Vectors live in the same transactional database as the lesson metadata — no sync gap between embeddings and truth. `AS OF SYSTEM TIME` on the same table gives time-travel recall for free.
 2. **Managed MCP Server** — humans supervise the tribe's memory from Claude Code: *"What has the tribe learned about the deploy API?"*, *"Which agent contributed the most helpful lessons?"*, *"Retire lesson X, it's outdated."* Configured from the Cloud Console (read-only mode + audit logging for safety). Tributary also ships its own MCP server (`mcp_server/`) so any MCP client can join the tribe as a first-class memory participant.
 3. **ccloud CLI** — used to provision the cluster, create the service account, and pull connection info (`ccloud cluster create`, `ccloud cluster sql --connection-url`).
 4. **Agent Skills Repo** — the schema and query patterns (enum status columns, vector index design, retry-on-40001) were built using the CockroachDB agent skills for schema/query design.
 
 **AWS:**
 
-1. **Amazon Bedrock** — Claude (agent reasoning + the lesson classifier + lesson distillation) and Titan Text Embeddings V2 (1024-d embeddings), via the Converse and InvokeModel APIs.
-2. **AWS Lambda + EventBridge** — the *Gardener* (`gardener/handler.py`) runs on a schedule: decays confidence of stale lessons and retires the withered ones, keeping shared memory trustworthy.
-3. **AWS App Runner** — hosts the public dashboard (live memory feed, lesson browser, conflict counter) from `dashboard/Dockerfile`.
+1. **AWS Lambda + EventBridge** — the *Gardener* (`gardener/handler.py`) runs on a schedule: decays confidence of stale lessons and retires the withered ones, keeping shared memory trustworthy.
+2. **AWS App Runner** — hosts the public dashboard (live memory feed, lesson browser, conflict counter) from `dashboard/Dockerfile`.
+
+(Agent reasoning + the lesson classifier run on the headless Claude Code CLI —
+`claude -p` — so agents use your existing Claude auth; embeddings come from a
+local sentence-transformers model.)
 
 ## Repo layout
 
@@ -149,10 +153,10 @@ TRIBUTARY_OFFLINE=1 pytest tests/ -v
 tributary/           the memory library (the product)
   memory.py            recall / learn / reinforce / retire
   db.py                CockroachDB connection + serializable-retry
-  embeddings.py        Titan wrapper (+ offline mode)
-  llm.py               Bedrock Converse + lesson classifier
+  embeddings.py        local sentence-transformers wrapper (+ offline mode)
+  llm.py               headless Claude Code CLI + lesson classifier
   schema.sql
-agents/              Bedrock Converse tool-use agent runner
+agents/              tool-use agent runner (headless Claude Code)
 gauntlet/            the trap environment for the demo
 mcp_server/          Tributary's own MCP server — any agent can join the tribe
 dashboard/           FastAPI dashboard (App Runner): feed, lessons, curve, time travel
@@ -171,7 +175,7 @@ cd infra && pip install -r requirements.txt && cdk bootstrap
 $env:DATABASE_URL = "<your-crdb-url>"; cdk deploy   # outputs the dashboard URL
 ```
 
-Full walkthrough (cluster via ccloud CLI, Bedrock model access, manual
+Full walkthrough (cluster via ccloud CLI, manual
 equivalents) in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## License

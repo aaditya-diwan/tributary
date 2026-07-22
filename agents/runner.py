@@ -1,4 +1,4 @@
-"""Agent runner: a Bedrock Converse tool-use loop wired into Tributary memory.
+"""Agent runner: a Claude Code (headless) tool-use loop wired into Tributary memory.
 
     python -m agents.runner --agent agent-a --task "Deploy the payments service"
 
@@ -40,7 +40,7 @@ def run_agent(agent_name: str, task: str, use_memory: bool = True,
     print(f"\n=== {agent_name} | task: {task} ===")
     print(f"    tribal lessons recalled: {len(recalled)}")
 
-    # --- the Converse tool-use loop ---
+    # --- the tool-use loop (Converse-shaped, backed by headless claude -p) ---
     messages = [{"role": "user", "content": [{"text": task}]}]
     tokens = {"input": 0, "output": 0}
     start = time.time()

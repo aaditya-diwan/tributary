@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS lessons (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     content        STRING NOT NULL,          -- the lesson itself, one or two crisp sentences
     situation      STRING NOT NULL,          -- when it applies, e.g. "deploying via the internal deploy API"
-    embedding      VECTOR(1024) NOT NULL,    -- Titan V2 embedding of situation + content
+    embedding      VECTOR(1024) NOT NULL,    -- 1024-d embedding of situation + content
     agent_id       UUID NOT NULL REFERENCES agents(id),
     task_id        UUID,
     evidence       STRING,                   -- what happened that taught this (error message, etc.)

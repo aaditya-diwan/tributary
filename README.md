@@ -64,7 +64,7 @@ uvicorn dashboard.app:app --reload               # dashboard at localhost:8000
 - **agent-a** (empty memory) hits every trap, figures them out, and distills lessons into Tributary.
 - **agent-b** (fresh process, seconds later) recalls those lessons and sails through, citing them: *"Tribal knowledge says the deploy API needs X-Batch: true — applying it."*
 
-Typical result: **~50–70% fewer tokens and half the steps.** Kill everything and run agent-c tomorrow — it still knows.
+Measured result (see the verified run below): **~20% fewer tokens and 2 fewer steps**, with agent-b citing each lesson by ID as it applies it. Kill everything and run agent-c tomorrow — it still knows.
 
 ### Join the tribe from Claude Code (or any MCP client)
 
@@ -128,6 +128,50 @@ The conflict guarantees are tested against a real cluster (no AWS needed — off
 ```bash
 TRIBUTARY_OFFLINE=1 pytest tests/ -v
 ```
+
+Tests run in their own `tributary_test` database (created automatically by
+`tests/conftest.py`), so fixture lessons — which carry fake offline
+embeddings — can never leak into the tribe's real memory.
+
+## Verified end-to-end run (2026-07-22)
+
+The full pipeline was exercised against a real CockroachDB Cloud serverless
+cluster (v26.2.1, AWS us-east-1) with real `claude -p` reasoning and real
+local embeddings. Observations:
+
+**Conflict tests: 4/4 passed** against the live cluster — concurrent
+contradiction resolution, sequential supersede chains, duplicate-reinforce,
+and paraphrase recall.
+
+**The A-then-B demo, from empty memory:**
+
+| agent | outcome | steps | tokens | lessons recalled |
+|---|---|---|---|---|
+| agent-a | SUCCESS | 11 | 2869 | 0 (learned 3) |
+| agent-b | SUCCESS | 9 | 2305 | 3 (reinforced all 3) |
+
+agent-b cited each tribal lesson by ID as it applied it (cache-clear on
+linker 137, `db_url_v2` on the empty config key, `X-Batch: true` on the
+first 429 — skipping the blind retry agent-a needed). Net: **20% fewer
+tokens, 2 fewer steps**, and confidence scores went up on all three lessons.
+
+**Gotchas found while testing** (all fixed in this repo):
+
+1. *TLS*: serverless clusters use Cockroach's own CA — system trust roots
+   aren't enough. Download the cluster cert to
+   `%APPDATA%\postgresql\root.crt` (libpq's default lookup path) or append
+   `&sslrootcert=<path>` to `DATABASE_URL`.
+2. *Test contamination*: the offline tests originally wrote fixture lessons
+   (fake embeddings) into the same database the demo reads — agent-a started
+   with 4 recalled lessons and the A-then-B comparison collapsed to
+   "-1 fewer steps". Fixed by isolating tests in `tributary_test`
+   (`tests/conftest.py`).
+3. *Windows console encoding*: the agent's reasoning text can contain
+   characters cp1252 can't print (`→`), which crashed a run mid-flight —
+   *after* solving the traps but *before* distilling lessons, losing them.
+   Fixed by reconfiguring stdout to UTF-8 in `agents/runner.py`.
+4. *First-run download*: the embedding model is ~1.3 GB; the first
+   `run_demo.py` invocation takes a few extra minutes.
 
 ## How the sponsor tools are used
 

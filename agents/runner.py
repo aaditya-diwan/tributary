@@ -10,7 +10,13 @@ memory, and reinforces the given lessons that actually helped.
 import argparse
 import json
 import re
+import sys
 import time
+
+# Windows consoles default to cp1252, which can't print the arrows/emoji the
+# model likes to emit — a UnicodeEncodeError mid-run would lose the lessons.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from tributary import llm, memory, runs
 from agents import prompts

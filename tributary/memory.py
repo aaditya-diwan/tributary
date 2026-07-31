@@ -10,7 +10,7 @@ database underneath it.
 from dataclasses import dataclass
 from datetime import datetime
 
-from tributary import guard, llm
+from tributary import guard, llm, telemetry
 from tributary.db import run_readonly, run_txn, vec_literal
 from tributary.embeddings import embed
 
@@ -194,6 +194,17 @@ def _fetch_candidates(vec: str) -> list[Lesson]:
 def learn(content: str, situation: str, agent_id: str, evidence: str = "",
           task_id: str | None = None, confidence: float = 0.6,
           screen: bool = True) -> dict:
+    """Write a lesson to shared memory (traced). See _learn_impl for details."""
+    with telemetry.span("memory.learn") as sp:
+        out = _learn_impl(content, situation, agent_id, evidence, task_id,
+                          confidence, screen)
+        sp.set_attribute("action", out["action"])
+        return out
+
+
+def _learn_impl(content: str, situation: str, agent_id: str, evidence: str = "",
+                task_id: str | None = None, confidence: float = 0.6,
+                screen: bool = True) -> dict:
     """Write a lesson to the shared memory, resolving conflicts transactionally.
 
     The expensive LLM classification runs *outside* the serializable

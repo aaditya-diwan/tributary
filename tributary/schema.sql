@@ -66,6 +66,21 @@ CREATE TABLE IF NOT EXISTS eval_results (
 
 CREATE INDEX IF NOT EXISTS eval_results_at_idx ON eval_results (suite, at DESC);
 
+-- Every LLM call, for the cost/latency dashboard and model-tiering analysis.
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    purpose    STRING NOT NULL,   -- classify | classify-escalated | screen | distill | agent-step | judge
+    model      STRING NOT NULL,
+    in_tokens  INT NOT NULL DEFAULT 0,
+    out_tokens INT NOT NULL DEFAULT 0,
+    cost_usd   FLOAT NOT NULL DEFAULT 0,
+    ms         INT NOT NULL DEFAULT 0,
+    escalated  BOOL NOT NULL DEFAULT false,
+    at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS llm_calls_at_idx ON llm_calls (at DESC);
+
 CREATE TABLE IF NOT EXISTS memory_audit (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     agent_id   UUID,

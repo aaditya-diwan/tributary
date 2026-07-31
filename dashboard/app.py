@@ -70,6 +70,56 @@ def lessons(status: str = "active"):
     return run_txn(txn)
 
 
+def _pct(values, p):
+    if not values:
+        return 0
+    s = sorted(values)
+    return s[min(len(s) - 1, int(round((p / 100) * (len(s) - 1))))]
+
+
+@app.get("/api/costs")
+def costs_api():
+    """Cost/latency rollup from llm_calls, plus the model-tiering split."""
+    def txn(cur):
+        cur.execute("SELECT count(*), COALESCE(sum(cost_usd),0), "
+                    "COALESCE(sum(escalated::INT),0) FROM llm_calls")
+        n, total_cost, escalations = cur.fetchone()
+        cur.execute("SELECT model, count(*), COALESCE(sum(cost_usd),0), "
+                    "COALESCE(avg(ms),0) FROM llm_calls GROUP BY model ORDER BY 3 DESC")
+        by_model = [{"model": r[0], "calls": int(r[1]), "cost_usd": round(float(r[2]), 4),
+                     "avg_ms": int(r[3])} for r in cur.fetchall()]
+        cur.execute("SELECT purpose, count(*), COALESCE(sum(cost_usd),0) "
+                    "FROM llm_calls GROUP BY purpose ORDER BY 2 DESC")
+        by_purpose = [{"purpose": r[0], "calls": int(r[1]), "cost_usd": round(float(r[2]), 4)}
+                      for r in cur.fetchall()]
+        cur.execute("SELECT ms FROM llm_calls ORDER BY at DESC LIMIT 1000")
+        ms = [int(r[0]) for r in cur.fetchall()]
+        cur.execute("SELECT count(*) FROM llm_calls WHERE purpose LIKE 'classify%'")
+        classify_calls = cur.fetchone()[0]
+        return {
+            "calls": int(n), "total_cost_usd": round(float(total_cost), 4),
+            "escalations": int(escalations),
+            "escalation_rate": round(float(escalations) / int(classify_calls), 3) if classify_calls else 0.0,
+            "p50_ms": _pct(ms, 50), "p95_ms": _pct(ms, 95),
+            "by_model": by_model, "by_purpose": by_purpose,
+        }
+    return run_txn(txn)
+
+
+@app.get("/api/eval_history")
+def eval_history(suite: str = "classification"):
+    """Metric-over-time from the eval harness — the demo's 'moving metric'."""
+    def txn(cur):
+        cur.execute(
+            "SELECT git_sha, tier, metrics, at FROM eval_results "
+            "WHERE suite = %s ORDER BY at ASC LIMIT 200",
+            (suite,),
+        )
+        return [{"git_sha": r[0], "tier": r[1], "metrics": r[2], "at": str(r[3])}
+                for r in cur.fetchall()]
+    return run_txn(txn)
+
+
 @app.get("/api/stats")
 def stats():
     def txn(cur):
@@ -122,6 +172,11 @@ PAGE = """<!doctype html><html><head><title>Tributary</title>
       Look</button>
     <div class="sub" style="margin-top:6px">Powered by CockroachDB AS OF SYSTEM TIME — no snapshots, just SQL.</div>
     <div id="past"></div></div>
+  <div class="card"><h2>💸 Cost &amp; latency — model tiering</h2>
+    <div id="costs"><div class=sub>No LLM calls logged yet (run online, not offline).</div></div></div>
+  <div class="card"><h2>📈 Classification accuracy over commits (eval harness)</h2>
+    <svg id="evalcurve" viewBox="0 0 400 150" style="width:100%"></svg>
+    <div class="sub">The metric that moves — each point is one eval run recorded to CockroachDB.</div></div>
 </div>
 <script>
 function lessonHtml(l){
@@ -153,6 +208,35 @@ async function drawCurve(){
       `<text x=${X(p[0])-8} y=148 fill="#7d8ca3" font-size=9>g${p[0]}</text>`).join('');
 }
 
+async function drawCosts(){
+  const c = await fetch('/api/costs').then(r=>r.json());
+  if(!c.calls){return;}
+  const models = c.by_model.map(m=>
+    `<div class=item><span class=who>${m.model}</span> `+
+    `<span class=badge>${m.calls} calls</span>`+
+    `<span class=badge>$${m.cost_usd.toFixed(4)}</span>`+
+    `<span class=badge>${m.avg_ms}ms avg</span></div>`).join('');
+  document.getElementById('costs').innerHTML =
+    `<div class=stats style="padding:0 0 10px">`+
+    `<div class=stat><b>$${c.total_cost_usd.toFixed(4)}</b>total</div>`+
+    `<div class=stat><b>${c.calls}</b>LLM calls</div>`+
+    `<div class=stat><b>${(c.escalation_rate*100).toFixed(0)}%</b>escalated</div>`+
+    `<div class=stat><b>${c.p95_ms}ms</b>p95 latency</div></div>`+models;
+}
+async function drawEval(){
+  const h = await fetch('/api/eval_history?suite=classification').then(r=>r.json());
+  const pts = h.filter(e=>e.tier==='live' && e.metrics && e.metrics.accuracy!=null)
+    .map((e,i)=>[i, e.metrics.accuracy, e.git_sha]);
+  const el = document.getElementById('evalcurve');
+  if(pts.length<2){el.innerHTML=
+    '<text x=10 y=30 fill="#7d8ca3" font-size=12>Run: python -m evals.run_eval --tier live</text>';return;}
+  const X=i=>20+i*(360/Math.max(pts.length-1,1)), Y=a=>135-a*115;
+  const line=pts.map((p,i)=>`${i?'L':'M'}${X(p[0])},${Y(p[1])}`).join(' ');
+  el.innerHTML=`<line x1=20 y1=${Y(1)} x2=380 y2=${Y(1)} stroke="#1e2a3f"/>`+
+    `<text x=2 y=${Y(1)+3} fill="#3a4a63" font-size=8>1.0</text>`+
+    `<path d="${line}" fill="none" stroke="#4ade80" stroke-width="2"/>`+
+    pts.map(p=>`<circle cx=${X(p[0])} cy=${Y(p[1])} r=3 fill="#ffb454"><title>${p[2]}: ${p[1]}</title></circle>`).join('');
+}
 async function tick(){
   const [feed, lessons, stats] = await Promise.all([
     fetch('/api/feed').then(r=>r.json()),
@@ -171,7 +255,9 @@ async function tick(){
     `<span class=badge>by ${l.learned_by}</span><span class=badge>conf ${l.confidence.toFixed(2)}</span>`+
     `<span class=badge>helped ${l.times_helpful}x</span></div>`).join('');
 }
-tick(); drawCurve(); setInterval(tick, 3000); setInterval(drawCurve, 10000);
+tick(); drawCurve(); drawCosts(); drawEval();
+setInterval(tick, 3000); setInterval(drawCurve, 10000);
+setInterval(drawCosts, 5000); setInterval(drawEval, 10000);
 </script></body></html>"""
 
 

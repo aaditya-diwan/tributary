@@ -17,8 +17,9 @@ tool-use loop in agents/runner.py) don't need to change.
 import json
 import re
 import subprocess
+import time
 
-from tributary import config
+from tributary import config, costs, telemetry
 
 TIMEOUT_SECONDS = 120
 
@@ -54,6 +55,7 @@ def _run(prompt: str, system: str, json_schema: dict | None = None,
     ]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
+    start = time.time()
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
@@ -66,21 +68,38 @@ def _run(prompt: str, system: str, json_schema: dict | None = None,
         )
     if proc.returncode != 0:
         raise RuntimeError(f"claude -p failed: {proc.stderr.strip()}")
-    return json.loads(proc.stdout)
+    result = json.loads(proc.stdout)
+    result["_elapsed_ms"] = int((time.time() - start) * 1000)
+    return result
 
 
-def complete(prompt: str, system: str | None = None, model: str | None = None) -> str:
+def _log(result: dict, purpose: str, model: str, escalated: bool = False) -> None:
+    """Emit cost/latency for one call to llm_calls (best-effort)."""
+    costs.log_call(purpose, model, result.get("usage", {}),
+                   result.get("total_cost_usd", 0.0) or 0.0,
+                   result.get("_elapsed_ms", 0), escalated=escalated)
+
+
+def complete(prompt: str, system: str | None = None, model: str | None = None,
+             purpose: str = "complete") -> str:
     """Single-turn text completion."""
-    result = _run(prompt, system or "You are a helpful assistant.", model=model)
+    used = model or config.CLAUDE_CODE_MODEL
+    with telemetry.span("llm.call", purpose=purpose, model=used):
+        result = _run(prompt, system or "You are a helpful assistant.", model=used)
+    _log(result, purpose, used)
     return (result.get("result") or "").strip()
 
 
-def structured(prompt: str, system: str, schema: dict, model: str | None = None) -> dict:
+def structured(prompt: str, system: str, schema: dict, model: str | None = None,
+               purpose: str = "structured") -> dict:
     """Single-turn completion constrained to a JSON schema (--json-schema).
 
     Returns the validated structured output, or {} if the model produced none.
     """
-    result = _run(prompt, system, json_schema=schema, model=model)
+    used = model or config.CLAUDE_CODE_MODEL
+    with telemetry.span("llm.call", purpose=purpose, model=used):
+        result = _run(prompt, system, json_schema=schema, model=used)
+    _log(result, purpose, used)
     return result.get("structured_output") or {}
 
 
@@ -134,11 +153,14 @@ def converse(messages, system: str | None = None, tools: list | None = None) -> 
             "before concluding. Set `tool_use` to null only when the task "
             "is complete or truly impossible."
         )
-    result = _run(
-        _render_transcript(messages) or "(begin)",
-        "\n\n".join(parts),
-        json_schema=TOOL_LOOP_SCHEMA if tools else None,
-    )
+    used = config.CLAUDE_CODE_MODEL
+    with telemetry.span("llm.call", purpose="agent-step", model=used):
+        result = _run(
+            _render_transcript(messages) or "(begin)",
+            "\n\n".join(parts),
+            json_schema=TOOL_LOOP_SCHEMA if tools else None,
+        )
+    _log(result, "agent-step", used)
 
     content = []
     stop_reason = "end_turn"
@@ -209,26 +231,7 @@ def _classify_prompt(new_situation: str, new_content: str, existing: list[dict])
     )
 
 
-def classify_lesson(new_situation: str, new_content: str, existing: list[dict],
-                    model: str | None = None) -> dict:
-    """Classify a new lesson against similar existing ones.
-
-    `existing` items: {"id": str, "situation": str, "content": str}.
-    Returns {"relation", "target_id", "confidence", "model"}. Uses the
-    CLI's constrained JSON output (--json-schema) so untrusted lesson text
-    cannot change the *shape* of the verdict — only its values, which are
-    then whitelisted against the candidate ids below.
-    """
-    if not existing:
-        return {"relation": "novel", "target_id": None, "confidence": 1.0, "model": "trivial"}
-    if config.OFFLINE:
-        out = _heuristic_classify(new_situation, new_content, existing)
-        out.update(confidence=1.0, model="heuristic")
-        return out
-
-    used_model = model or config.CLAUDE_CODE_MODEL
-    out = structured(_classify_prompt(new_situation, new_content, existing),
-                     CLASSIFY_SYSTEM, CLASSIFY_SCHEMA, model=used_model)
+def _parse_verdict(out: dict, existing: list[dict], model: str) -> dict:
     relation = out.get("relation")
     if relation not in ("duplicate", "contradicts", "novel"):
         relation = "novel"
@@ -239,7 +242,61 @@ def classify_lesson(new_situation: str, new_content: str, existing: list[dict],
     if not isinstance(confidence, (int, float)):
         confidence = 0.0  # unparseable verdict -> treat as low-confidence
     return {"relation": relation, "target_id": target,
-            "confidence": float(confidence), "model": used_model}
+            "confidence": float(confidence), "model": model}
+
+
+def classify_lesson(new_situation: str, new_content: str, existing: list[dict],
+                    model: str | None = None) -> dict:
+    """Classify a new lesson against similar existing ones, with model tiering.
+
+    The cheap model classifies first; if the verdict is a contradiction
+    (destructive — it would supersede a lesson) or its confidence is below
+    CLASSIFY_ESCALATE_BELOW, the call is re-run on the stronger model and that
+    verdict wins. Both calls are cost-logged; escalation is flagged.
+
+    `existing` items: {"id": str, "situation": str, "content": str}. Uses the
+    CLI's constrained JSON output so untrusted lesson text cannot change the
+    verdict *shape* — only its values, which are whitelisted against the
+    candidate ids.
+    """
+    if not existing:
+        return {"relation": "novel", "target_id": None, "confidence": 1.0,
+                "model": "trivial", "escalated": False}
+    if config.OFFLINE:
+        out = _heuristic_classify(new_situation, new_content, existing)
+        out.update(confidence=1.0, model="heuristic", escalated=False)
+        return out
+
+    prompt = _classify_prompt(new_situation, new_content, existing)
+    if model:  # explicit override skips tiering
+        verdict = _parse_verdict(
+            structured(prompt, CLASSIFY_SYSTEM, CLASSIFY_SCHEMA, model=model,
+                       purpose="classify"), existing, model)
+        verdict["escalated"] = False
+        return verdict
+
+    cheap = config.CLASSIFY_MODEL_CHEAP
+    with telemetry.span("llm.classify", model=cheap) as sp:
+        verdict = _parse_verdict(
+            structured(prompt, CLASSIFY_SYSTEM, CLASSIFY_SCHEMA, model=cheap,
+                       purpose="classify"), existing, cheap)
+        sp.set_attribute("relation", verdict["relation"])
+        sp.set_attribute("confidence", verdict["confidence"])
+
+        needs_strong = (verdict["relation"] == "contradicts"
+                        or verdict["confidence"] < config.CLASSIFY_ESCALATE_BELOW)
+        strong = config.CLASSIFY_MODEL_STRONG
+        if needs_strong and strong != cheap:
+            with telemetry.span("llm.call", purpose="classify-escalated", model=strong) as es:
+                result = _run(prompt, CLASSIFY_SYSTEM, json_schema=CLASSIFY_SCHEMA, model=strong)
+                es.set_attribute("escalated", True)
+            _log(result, "classify-escalated", strong, escalated=True)
+            verdict = _parse_verdict(result.get("structured_output") or {}, existing, strong)
+            verdict["escalated"] = True
+            sp.set_attribute("escalated", True)
+        else:
+            verdict["escalated"] = False
+    return verdict
 
 
 def _word_set(text: str) -> set[str]:

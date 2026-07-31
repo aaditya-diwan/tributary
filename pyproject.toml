@@ -14,6 +14,10 @@ dependencies = [
 embeddings = ["sentence-transformers>=3.0"]
 dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
 mcp = ["mcp>=1.6"]
+otel = [
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-exporter-otlp-proto-http>=1.25",
+]
 dev = ["pytest>=8.0"]
 
 [build-system]

@@ -24,23 +24,32 @@ def run_txn(fn, retries: int = MAX_RETRIES):
     surface as a retryable error rather than silent lost updates. This is the
     property Tributary leans on for conflict-safe shared memory.
     """
+    from tributary import telemetry
+
     last_err = None
-    for attempt in range(retries):
-        try:
-            with connect() as conn:
-                with conn.cursor() as cur:
-                    result = fn(cur)
-                conn.commit()
-                return result
-        except psycopg.errors.SerializationFailure as e:
-            last_err = e
-            time.sleep(0.05 * (2**attempt))  # brief backoff, then retry
-        except psycopg.Error as e:
-            if getattr(e, "sqlstate", None) == RETRYABLE_SQLSTATE:
+    with telemetry.span("db.txn") as sp:
+        for attempt in range(retries):
+            try:
+                with connect() as conn:
+                    with conn.cursor() as cur:
+                        result = fn(cur)
+                    conn.commit()
+                    # Serializable retries are the headline cost of the
+                    # conflict-safety guarantee — surface the count as a span
+                    # attribute so it's visible in traces under contention.
+                    sp.set_attribute("db.txn.attempts", attempt + 1)
+                    return result
+            except psycopg.errors.SerializationFailure as e:
                 last_err = e
-                time.sleep(0.05 * (2**attempt))
-            else:
-                raise
+                time.sleep(0.05 * (2**attempt))  # brief backoff, then retry
+            except psycopg.Error as e:
+                if getattr(e, "sqlstate", None) == RETRYABLE_SQLSTATE:
+                    last_err = e
+                    time.sleep(0.05 * (2**attempt))
+                else:
+                    raise
+        sp.set_attribute("db.txn.attempts", retries)
+        sp.set_attribute("db.txn.exhausted", True)
     raise last_err
 
 

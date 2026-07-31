@@ -87,5 +87,14 @@ def init_schema() -> None:
     with connect() as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
+            # Vector indexes are a preview feature gated behind a cluster
+            # setting. Cloud clusters enable it by default; a fresh self-hosted
+            # node does not. Best-effort enable it so `CREATE VECTOR INDEX`
+            # below works — ignore the failure when the connecting role lacks
+            # admin (e.g. Cloud, where it's already on anyway).
+            try:
+                cur.execute("SET CLUSTER SETTING feature.vector_index.enabled = true")
+            except psycopg.Error:
+                pass  # not permitted (Cloud) — already enabled there anyway
             for stmt in statements:
                 cur.execute(stmt)

@@ -19,6 +19,10 @@ jobs:
             docker exec crdb ./cockroach sql --insecure -e 'SELECT 1' && break
             sleep 2
           done
+          # Vector indexes are a preview feature gated behind a cluster setting.
+          # Cloud clusters enable it by default; a fresh self-hosted node does not.
+          docker exec crdb ./cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
 
       - uses: actions/setup-python@v5
         with:

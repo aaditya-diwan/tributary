@@ -182,8 +182,11 @@ def run_e2e(tier: str, limit: int | None) -> dict:
 
     _db.use_isolated_db()
     _db.clear_lessons()
-    agent_a = memory.ensure_agent("eval-agent-a")
-    agent_b = memory.ensure_agent("eval-agent-b")
+    # Curators: the e2e suite pins the transactional supersede *mechanism*,
+    # which is a curator privilege. The writer-level dispute path is asserted
+    # in tests/test_injection.py.
+    agent_a = memory.ensure_agent("eval-agent-a", role="curator")
+    agent_b = memory.ensure_agent("eval-agent-b", role="curator")
 
     def statuses(ids):
         def txn(cur):
@@ -327,15 +330,50 @@ def run_judge(tier: str, limit: int | None) -> dict:
     }
 
 
+def run_redteam(tier: str, limit: int | None) -> dict:
+    """Adversarial lesson-writes vs. the injection screen. Measures how many
+    attacks are blocked and, separately, the false-positive rate on benign
+    ops lessons — a screen that blocks everything is useless."""
+    from tributary import guard
+
+    cases = load_jsonl(GOLDEN / "redteam.jsonl")[:limit]
+    attacks = [c for c in cases if c["expect_blocked"]]
+    benign = [c for c in cases if not c["expect_blocked"]]
+    blocked_attacks, leaked, false_positives = 0, [], []
+
+    for c in cases:
+        verdict = guard.screen_lesson(c["situation"], c["content"])
+        blocked = verdict["verdict"] == "quarantine"
+        if c["expect_blocked"]:
+            blocked_attacks += blocked
+            if not blocked:
+                leaked.append({"id": c["id"], "attack": c["attack"]})
+        elif blocked:
+            false_positives.append({"id": c["id"], "reasons": verdict["reasons"]})
+        if tier == "live":
+            print(f"  {c['id']} ({c['attack']}): "
+                  f"{'blocked' if blocked else 'PASSED THROUGH'} {verdict['reasons']}")
+
+    return {
+        "attacks": len(attacks),
+        "benign": len(benign),
+        "block_rate": round(blocked_attacks / len(attacks), 3) if attacks else 1.0,
+        "false_positive_rate": round(len(false_positives) / len(benign), 3) if benign else 0.0,
+        "leaked": leaked,
+        "false_positives": false_positives,
+    }
+
+
 SUITES = {
     "classification": run_classification,
     "retrieval": run_retrieval,
     "e2e": run_e2e,
     "judge": run_judge,
+    "redteam": run_redteam,
 }
 DEFAULT_SUITES = {
-    "offline": ["classification", "retrieval", "e2e"],
-    "live": ["classification", "retrieval", "judge"],
+    "offline": ["classification", "retrieval", "e2e", "redteam"],
+    "live": ["classification", "retrieval", "judge", "redteam"],
 }
 DB_SUITES = {"retrieval", "e2e"}
 
@@ -425,7 +463,8 @@ def main():
         metrics = SUITES[suite](args.tier, args.limit)
         results[suite] = metrics
         display = {k: v for k, v in metrics.items()
-                   if k not in ("failures", "misses", "details", "confusion", "scenarios")}
+                   if k not in ("failures", "misses", "details", "confusion",
+                                "scenarios", "leaked", "false_positives")}
         print(f"  {json.dumps(display)}")
         record(original_db_url, args.tier, suite, metrics, sha)
 

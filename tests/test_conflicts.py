@@ -26,7 +26,11 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def agents():
-    return memory.ensure_agent("test-agent-a"), memory.ensure_agent("test-agent-b")
+    # Curators: these tests exercise the transactional supersede *mechanism*,
+    # which is a curator privilege. The writer-level dispute path (a writer may
+    # not overturn another agent's lesson) is covered in test_injection.py.
+    return (memory.ensure_agent("test-agent-a", role="curator"),
+            memory.ensure_agent("test-agent-b", role="curator"))
 
 
 def _statuses(ids):

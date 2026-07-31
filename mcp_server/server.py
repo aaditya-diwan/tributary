@@ -31,7 +31,8 @@ def _me() -> str:
     global _agent_id
     if _agent_id is None:
         _agent_id = memory.ensure_agent(
-            os.environ.get("TRIBUTARY_AGENT_NAME", "mcp-agent")
+            os.environ.get("TRIBUTARY_AGENT_NAME", "mcp-agent"),
+            role=os.environ.get("TRIBUTARY_AGENT_ROLE", "writer"),
         )
     return _agent_id
 
@@ -60,9 +61,17 @@ def tribal_learn(content: str, situation: str, evidence: str = "") -> str:
     solving something non-obvious. `situation` = when the lesson applies
     (e.g. "deploying via the internal deploy API"); `content` = one crisp
     sentence; `evidence` = what happened that taught it. Duplicates reinforce
-    the existing lesson; contradictions supersede it transactionally."""
-    out = memory.learn(content, situation, _me(), evidence=evidence)
-    return json.dumps({"action": out["action"], "lesson": _lesson_dict(out["lesson"])}, indent=2)
+    the existing lesson; contradictions supersede it transactionally.
+    Instruction-shaped content is quarantined; contradicting another agent's
+    lesson is filed for curator review unless you are a curator."""
+    try:
+        out = memory.learn(content, situation, _me(), evidence=evidence)
+    except memory.PrivilegeError as e:
+        return json.dumps({"error": str(e)})
+    result = {"action": out["action"], "lesson": _lesson_dict(out["lesson"])}
+    if out.get("reasons"):
+        result["quarantine_reasons"] = out["reasons"]
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()

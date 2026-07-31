@@ -27,7 +27,7 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
 
-      - name: Conflict tests (offline, real CockroachDB)
+      - name: Conflict + injection tests (offline, real CockroachDB)
         env:
           TRIBUTARY_OFFLINE: "1"
           DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable

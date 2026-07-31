@@ -8,6 +8,9 @@
     },
     "e2e": {
       "pass_rate": 1.0
+    },
+    "redteam": {
+      "block_rate": 1.0
     }
   },
   "live": {

@@ -10,9 +10,18 @@ database underneath it.
 from dataclasses import dataclass
 from datetime import datetime
 
-from tributary import llm
+from tributary import guard, llm
 from tributary.db import run_readonly, run_txn, vec_literal
 from tributary.embeddings import embed
+
+
+class PrivilegeError(PermissionError):
+    """An agent attempted an action its role does not permit."""
+
+
+# Role -> permitted actions. Overturning another agent's lesson (supersede via
+# contradiction, or retire) is curator-only; writers get a `disputed` filing.
+WRITE_ROLES = {"writer", "curator"}
 
 # Cosine distance below which an existing lesson is "similar enough" to be a
 # candidate duplicate/contradiction for a new lesson.
@@ -60,21 +69,29 @@ class Lesson:
 _LESSON_COLS = "id, content, situation, agent_id, confidence, times_helpful, created_at"
 
 
-def ensure_agent(name: str) -> str:
-    """Register (or refresh) an agent by name; returns its id."""
+def ensure_agent(name: str, role: str = "writer") -> str:
+    """Register (or refresh) an agent by name and role; returns its id."""
+    if role not in ("reader", "writer", "curator"):
+        raise ValueError(f"unknown role: {role}")
 
     def txn(cur):
         cur.execute(
             """
-            INSERT INTO agents (name, last_seen) VALUES (%s, now())
-            ON CONFLICT (name) DO UPDATE SET last_seen = now()
+            INSERT INTO agents (name, role, last_seen) VALUES (%s, %s, now())
+            ON CONFLICT (name) DO UPDATE SET last_seen = now(), role = EXCLUDED.role
             RETURNING id
             """,
-            (name,),
+            (name, role),
         )
         return str(cur.fetchone()[0])
 
     return run_txn(txn)
+
+
+def _role(cur, agent_id: str) -> str:
+    cur.execute("SELECT role FROM agents WHERE id = %s", (agent_id,))
+    row = cur.fetchone()
+    return row[0] if row else "reader"
 
 
 def recall(query: str, agent_id: str | None = None, k: int = 5,
@@ -186,10 +203,27 @@ def learn(content: str, situation: str, agent_id: str, evidence: str = "",
     40001 retry rate) without giving up the conflict-safety guarantee — the
     in-txn re-validation is what preserves it.
 
-    Returns {"action": "inserted"|"reinforced"|"superseded", "lesson": Lesson,
-    "verdict": {...}}. Raises if a screening policy rejects the content.
+    Returns {"action": "inserted"|"reinforced"|"superseded"|"quarantined"|
+    "disputed", "lesson": Lesson, "verdict": {...}}.
+
+    Raises PrivilegeError if the agent's role may not write.
     """
     vec = vec_literal(embed(f"{situation}: {content}"))
+
+    # 1. Privilege gate: readers may not write.
+    role = run_readonly("SELECT role FROM agents WHERE id = %s", (agent_id,))
+    role = role[0][0] if role else "reader"
+    if role not in WRITE_ROLES:
+        _audit_blocked(agent_id, "learn", f"role={role} may not write")
+        raise PrivilegeError(f"agent role '{role}' is not permitted to write lessons")
+
+    # 2. Injection screen: instruction-shaped content is quarantined out of
+    #    recall and out of the classifier's context before it can spread.
+    if screen:
+        screened = guard.screen_lesson(situation, content)
+        if screened["verdict"] == "quarantine":
+            return _quarantine(content, situation, vec, agent_id, task_id,
+                               evidence, screened["reasons"])
 
     last_verdict = {"relation": "novel", "target_id": None, "confidence": 1.0}
     for attempt in range(MAX_CLASSIFY_ATTEMPTS):
@@ -212,18 +246,51 @@ def learn(content: str, situation: str, agent_id: str, evidence: str = "",
 
         try:
             return run_txn(lambda cur: _apply_verdict(
-                cur, content, situation, vec, agent_id, task_id, confidence,
+                cur, content, situation, vec, agent_id, role, task_id, confidence,
                 evidence, verdict, candidate_ids))
         except _StaleCandidates:
             continue  # candidate set moved; reclassify against the new view
 
     # Unreachable in practice (last attempt forces novel), but keep it total.
     return run_txn(lambda cur: _apply_verdict(
-        cur, content, situation, vec, agent_id, task_id, confidence, evidence,
+        cur, content, situation, vec, agent_id, role, task_id, confidence, evidence,
         {"relation": "novel", "target_id": None, "confidence": 1.0}, ()))
 
 
-def _apply_verdict(cur, content, situation, vec, agent_id, task_id, confidence,
+def _quarantine(content, situation, vec, agent_id, task_id, evidence, reasons) -> dict:
+    """Store a screened-out lesson as quarantined (never recalled) and log it."""
+    def txn(cur):
+        cur.execute(
+            f"""
+            INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
+                                 evidence, confidence, status)
+            VALUES (%s, %s, %s::VECTOR, %s, %s, %s, 0.0, 'quarantined')
+            RETURNING {_LESSON_COLS}
+            """,
+            (content, situation, vec, agent_id, task_id, evidence),
+        )
+        lesson = Lesson.from_row(cur.fetchone())
+        cur.execute(
+            "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
+            "VALUES (%s, 'quarantine', %s, %s)",
+            (agent_id, lesson.id, "injection screen: " + ",".join(reasons)),
+        )
+        return {"action": "quarantined", "lesson": lesson, "reasons": reasons}
+
+    return run_txn(txn)
+
+
+def _audit_blocked(agent_id, action, detail) -> None:
+    def txn(cur):
+        cur.execute(
+            "INSERT INTO memory_audit (agent_id, action, detail) "
+            "VALUES (%s, 'blocked', %s)",
+            (agent_id, f"{action}: {detail}"),
+        )
+    run_txn(txn)
+
+
+def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confidence,
                    evidence, verdict, classified_against: tuple) -> dict:
     """Re-validate the classifier's view, then apply the verdict atomically.
 
@@ -274,7 +341,36 @@ def _apply_verdict(cur, content, situation, vec, agent_id, task_id, confidence,
             return {"action": "reinforced", "lesson": existing, "verdict": verdict}
         # Target vanished (retired/superseded concurrently) -> insert as novel.
 
-    # 3b/3c. Insert the new lesson; if it contradicts, supersede the old one.
+    # 3b/3c. Decide whether a contradiction may supersede, or must be disputed.
+    # Overturning another agent's active lesson is a curator privilege; a
+    # writer's contradiction of someone else's lesson is filed as `disputed`
+    # (stored, not recalled) for curator review — so no single writer can
+    # silently delete the tribe's shared knowledge via a crafted contradiction.
+    target_owner = next((c.agent_id for c in current
+                         if c.id == verdict.get("target_id")), None)
+    contradicts = verdict["relation"] == "contradicts" and verdict.get("target_id")
+    must_dispute = (contradicts and target_owner not in (None, agent_id)
+                    and role != "curator")
+
+    if must_dispute:
+        cur.execute(
+            f"""
+            INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
+                                 evidence, confidence, status)
+            VALUES (%s, %s, %s::VECTOR, %s, %s, %s, %s, 'disputed')
+            RETURNING {_LESSON_COLS}
+            """,
+            (content, situation, vec, agent_id, task_id, evidence, confidence),
+        )
+        new = Lesson.from_row(cur.fetchone())
+        cur.execute(
+            "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
+            "VALUES (%s, 'dispute', %s, %s)",
+            (agent_id, new.id, f"contradicts {verdict['target_id']} (curator review)"),
+        )
+        return {"action": "disputed", "lesson": new, "verdict": verdict,
+                "target_id": verdict["target_id"]}
+
     cur.execute(
         f"""
         INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
@@ -287,7 +383,7 @@ def _apply_verdict(cur, content, situation, vec, agent_id, task_id, confidence,
     new = Lesson.from_row(cur.fetchone())
     action = "inserted"
 
-    if verdict["relation"] == "contradicts":
+    if contradicts:
         # Newer evidence wins; keep the chain for provenance. The WHERE
         # status = 'active' makes the supersede idempotent under a concurrent
         # winner — if someone already superseded it, we simply don't.
@@ -331,9 +427,18 @@ def reinforce(lesson_id: str, agent_id: str | None = None) -> None:
 
 
 def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> None:
-    """Manually retire a lesson (also doable by a human via the MCP Server)."""
+    """Retire a lesson. Curator-only — retiring shared knowledge is the most
+    destructive write, so it needs the highest privilege. A human curating via
+    the MCP Server (TRIBUTARY_AGENT_ROLE=curator) qualifies."""
 
     def txn(cur):
+        if agent_id is not None and _role(cur, agent_id) != "curator":
+            cur.execute(
+                "INSERT INTO memory_audit (agent_id, action, detail) "
+                "VALUES (%s, 'blocked', %s)",
+                (agent_id, f"retire {lesson_id}: curator role required"),
+            )
+            raise PrivilegeError("retiring a lesson requires the curator role")
         cur.execute("UPDATE lessons SET status = 'retired' WHERE id = %s", (lesson_id,))
         cur.execute(
             "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
@@ -342,3 +447,35 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> Non
         )
 
     run_txn(txn)
+
+
+def resolve_dispute(lesson_id: str, curator_id: str, accept: bool) -> dict:
+    """Curator resolves a disputed lesson: accept it (activate + supersede the
+    lesson it contradicted) or reject it (retire the challenger)."""
+    def txn(cur):
+        if _role(cur, curator_id) != "curator":
+            raise PrivilegeError("resolving disputes requires the curator role")
+        cur.execute(
+            f"SELECT {_LESSON_COLS} FROM lessons WHERE id = %s AND status = 'disputed'",
+            (lesson_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("no disputed lesson with that id")
+        lesson = Lesson.from_row(row)
+        if not accept:
+            cur.execute("UPDATE lessons SET status = 'retired' WHERE id = %s", (lesson_id,))
+            cur.execute(
+                "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
+                "VALUES (%s, 'retire', %s, 'dispute rejected')", (curator_id, lesson_id))
+            return {"action": "rejected", "lesson": lesson}
+        # Accept: find the active lesson it contradicts and supersede it.
+        cur.execute(
+            "UPDATE lessons SET status = 'active' WHERE id = %s", (lesson_id,))
+        cur.execute(
+            "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
+            "VALUES (%s, 'dispute-accept', %s, 'activated by curator')",
+            (curator_id, lesson_id))
+        return {"action": "accepted", "lesson": lesson}
+
+    return run_txn(txn)

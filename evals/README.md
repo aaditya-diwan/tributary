@@ -36,6 +36,13 @@ regression gate compares one key metric per suite against `evals/baseline.json`
   (`tributary_eval` database, auto-created): duplicate→reinforce,
   contradiction→supersede with provenance, concurrent contradiction→exactly
   one active lesson. Offline-only so it's deterministic.
+- **redteam** — adversarial lesson-writes (`golden/redteam.jsonl`) against the
+  injection screen (`tributary/guard.py`): classifier-hijacks, reader
+  tool-hijacks, exfiltration, role-hijacks, fence breakouts. Metrics:
+  `block_rate` (attacks quarantined) and `false_positive_rate` (benign ops
+  lessons wrongly blocked — currently 0.0). The full write-path enforcement
+  (quarantine + recall exclusion + privilege separation + curator disputes)
+  is covered by `tests/test_injection.py`.
 - **judge** — LLM-as-judge over golden distillations
   (`golden/distillation.jsonl`), each hand-labeled 1–5. The suite reports the
   judge's agreement with the human labels (exact, within-1, Pearson r) — the

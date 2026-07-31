@@ -70,7 +70,10 @@ def init_schema() -> None:
     used by statements later in the same file — CockroachDB won't let a new
     enum value or column be referenced inside the transaction that added it.
     """
-    schema = (Path(__file__).parent / "schema.sql").read_text()
+    raw = (Path(__file__).parent / "schema.sql").read_text()
+    # Strip `--` line comments before splitting on ';' so a semicolon inside a
+    # comment doesn't get mistaken for a statement terminator.
+    schema = "\n".join(line.split("--", 1)[0] for line in raw.splitlines())
     statements = [s.strip() for s in schema.split(";") if s.strip()]
     with connect() as conn:
         conn.autocommit = True

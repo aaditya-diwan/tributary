@@ -3,11 +3,20 @@
 CREATE TABLE IF NOT EXISTS agents (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name       STRING NOT NULL UNIQUE,
+    role       STRING NOT NULL DEFAULT 'writer',  -- reader | writer | curator
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen  TIMESTAMPTZ
 );
 
+-- Privilege separation for existing databases created before the role column.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS role STRING NOT NULL DEFAULT 'writer';
+
+-- 'quarantined' = failed the injection screen; 'disputed' = a writer challenged
+-- another agent's lesson and it awaits curator review. Neither is recalled or
+-- shown to the classifier, so poisoned/contested content can't spread.
 CREATE TYPE IF NOT EXISTS lesson_status AS ENUM ('active', 'superseded', 'retired');
+ALTER TYPE lesson_status ADD VALUE IF NOT EXISTS 'quarantined';
+ALTER TYPE lesson_status ADD VALUE IF NOT EXISTS 'disputed';
 
 CREATE TABLE IF NOT EXISTS lessons (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),

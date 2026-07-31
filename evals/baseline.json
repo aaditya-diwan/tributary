@@ -9,5 +9,16 @@
     "e2e": {
       "pass_rate": 1.0
     }
+  },
+  "live": {
+    "classification": {
+      "accuracy": 1.0
+    },
+    "retrieval": {
+      "hit@5": 1.0
+    },
+    "judge": {
+      "within1_agreement": 0.75
+    }
   }
 }

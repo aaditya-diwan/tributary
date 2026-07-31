@@ -36,5 +36,14 @@ def test_database():
         conn.execute(f"CREATE DATABASE IF NOT EXISTS {TEST_DB}")
     config.DATABASE_URL = _with_database(original, TEST_DB)
     db.init_schema()
+    # Start from an empty tribe every session. Fixtures use unique markers, but
+    # the offline heuristic classifier matches on the *other* words, so a lesson
+    # left over from a prior run can classify a fresh fixture as a duplicate and
+    # make an assertion fail non-deterministically. CI gets a fresh DB anyway;
+    # this makes repeated local runs behave identically.
+    def _clear(cur):
+        cur.execute("DELETE FROM memory_audit")
+        cur.execute("DELETE FROM lessons")
+    db.run_txn(_clear)
     yield
     config.DATABASE_URL = original

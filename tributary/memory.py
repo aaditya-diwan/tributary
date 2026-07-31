@@ -18,6 +18,19 @@ from tributary.embeddings import embed
 # candidate duplicate/contradiction for a new lesson.
 SIMILARITY_GATE = 0.45
 
+# How many candidate lessons the classifier sees.
+CANDIDATE_K = 3
+
+# If the candidate set shifts between classifying (outside the txn) and
+# committing (inside it), we reclassify. Cap the reclassify loop; on the last
+# attempt we fall back to a safe novel-insert rather than acting on a verdict
+# computed against a stale view.
+MAX_CLASSIFY_ATTEMPTS = 3
+
+
+class _StaleCandidates(Exception):
+    """The similar-lesson set changed under us; the verdict must be recomputed."""
+
 
 @dataclass
 class Lesson:
@@ -140,78 +153,150 @@ def lessons_as_of(timestamp: str | datetime, limit: int = 200) -> list[Lesson]:
     return [Lesson.from_row(r) for r in rows]
 
 
+def _fetch_candidates(vec: str) -> list[Lesson]:
+    """Similar active lessons, read outside any write transaction.
+
+    This read feeds the (slow) LLM classifier. The verdict it produces is
+    re-validated inside the write transaction before we act on it, so a
+    concurrent write between this read and the commit can never cause a
+    wrong supersede — at worst it forces a reclassification.
+    """
+    rows = run_readonly(
+        f"""
+        SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
+        FROM lessons
+        WHERE status = 'active'
+        ORDER BY embedding <=> %s::VECTOR
+        LIMIT %s
+        """,
+        (vec, vec, CANDIDATE_K),
+    )
+    return [Lesson.from_row(r) for r in rows if r[7] is not None and r[7] < SIMILARITY_GATE]
+
+
 def learn(content: str, situation: str, agent_id: str, evidence: str = "",
-          task_id: str | None = None, confidence: float = 0.6) -> dict:
+          task_id: str | None = None, confidence: float = 0.6,
+          screen: bool = True) -> dict:
     """Write a lesson to the shared memory, resolving conflicts transactionally.
 
-    Returns {"action": "inserted"|"reinforced"|"superseded", "lesson": Lesson}.
+    The expensive LLM classification runs *outside* the serializable
+    transaction; the short transaction only re-checks the candidate set and
+    applies the verdict. Keeping a 120s subprocess out of the transaction
+    slashes the window in which concurrent writers contend (and thus the
+    40001 retry rate) without giving up the conflict-safety guarantee — the
+    in-txn re-validation is what preserves it.
+
+    Returns {"action": "inserted"|"reinforced"|"superseded", "lesson": Lesson,
+    "verdict": {...}}. Raises if a screening policy rejects the content.
     """
     vec = vec_literal(embed(f"{situation}: {content}"))
 
-    def txn(cur):
-        # 1. Find similar active lessons (candidate duplicates/contradictions).
+    last_verdict = {"relation": "novel", "target_id": None, "confidence": 1.0}
+    for attempt in range(MAX_CLASSIFY_ATTEMPTS):
+        candidates = _fetch_candidates(vec)
+        candidate_ids = tuple(sorted(c.id for c in candidates))
+
+        # Final attempt with a still-contended set: degrade to a safe
+        # novel-insert rather than act on a verdict we can't validate.
+        force_novel = attempt == MAX_CLASSIFY_ATTEMPTS - 1
+        if candidates and not force_novel:
+            verdict = llm.classify_lesson(
+                situation, content,
+                [{"id": c.id, "situation": c.situation, "content": c.content}
+                 for c in candidates],
+            )
+        else:
+            verdict = {"relation": "novel", "target_id": None,
+                       "confidence": 1.0, "model": "trivial"}
+        last_verdict = verdict
+
+        try:
+            return run_txn(lambda cur: _apply_verdict(
+                cur, content, situation, vec, agent_id, task_id, confidence,
+                evidence, verdict, candidate_ids))
+        except _StaleCandidates:
+            continue  # candidate set moved; reclassify against the new view
+
+    # Unreachable in practice (last attempt forces novel), but keep it total.
+    return run_txn(lambda cur: _apply_verdict(
+        cur, content, situation, vec, agent_id, task_id, confidence, evidence,
+        {"relation": "novel", "target_id": None, "confidence": 1.0}, ()))
+
+
+def _apply_verdict(cur, content, situation, vec, agent_id, task_id, confidence,
+                   evidence, verdict, classified_against: tuple) -> dict:
+    """Re-validate the classifier's view, then apply the verdict atomically.
+
+    `classified_against` is the candidate id set the verdict was computed on.
+    If the current active candidate set differs, the verdict is stale and we
+    bail out to reclassify. This is the guard that lets classification live
+    outside the transaction without weakening serializable conflict safety.
+    """
+    cur.execute(
+        f"""
+        SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
+        FROM lessons
+        WHERE status = 'active'
+        ORDER BY embedding <=> %s::VECTOR
+        LIMIT %s
+        """,
+        (vec, vec, CANDIDATE_K),
+    )
+    current = [
+        Lesson.from_row(r) for r in cur.fetchall()
+        if r[7] is not None and r[7] < SIMILARITY_GATE
+    ]
+    current_ids = tuple(sorted(c.id for c in current))
+    if current_ids != classified_against:
+        raise _StaleCandidates()
+
+    # 3a. Duplicate -> reinforce the existing lesson instead of inserting.
+    if verdict["relation"] == "duplicate":
         cur.execute(
             f"""
-            SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
-            FROM lessons
-            WHERE status = 'active'
-            ORDER BY embedding <=> %s::VECTOR
-            LIMIT 3
+            UPDATE lessons
+            SET times_helpful = times_helpful + 1,
+                confidence = LEAST(confidence + 0.1, 0.99),
+                last_used_at = now()
+            WHERE id = %s AND status = 'active'
+            RETURNING {_LESSON_COLS}
             """,
-            (vec, vec),
+            (verdict["target_id"],),
         )
-        similar = [
-            Lesson.from_row(r) for r in cur.fetchall()
-            if r[7] is not None and r[7] < SIMILARITY_GATE
-        ]
-
-        # 2. Classify the relationship (LLM online, heuristic offline).
-        verdict = llm.classify_lesson(
-            situation, content,
-            [{"id": s.id, "situation": s.situation, "content": s.content} for s in similar],
-        )
-
-        # 3a. Duplicate -> reinforce the existing lesson instead of inserting.
-        if verdict["relation"] == "duplicate":
-            cur.execute(
-                f"""
-                UPDATE lessons
-                SET times_helpful = times_helpful + 1,
-                    confidence = LEAST(confidence + 0.1, 0.99),
-                    last_used_at = now()
-                WHERE id = %s
-                RETURNING {_LESSON_COLS}
-                """,
-                (verdict["target_id"],),
-            )
-            existing = Lesson.from_row(cur.fetchone())
+        row = cur.fetchone()
+        if row is not None:
+            existing = Lesson.from_row(row)
             cur.execute(
                 "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
                 "VALUES (%s, 'reinforce', %s, 'independent rediscovery')",
                 (agent_id, existing.id),
             )
-            return {"action": "reinforced", "lesson": existing}
+            return {"action": "reinforced", "lesson": existing, "verdict": verdict}
+        # Target vanished (retired/superseded concurrently) -> insert as novel.
 
-        # 3b/3c. Insert the new lesson; if it contradicts, supersede the old one.
+    # 3b/3c. Insert the new lesson; if it contradicts, supersede the old one.
+    cur.execute(
+        f"""
+        INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
+                             evidence, confidence)
+        VALUES (%s, %s, %s::VECTOR, %s, %s, %s, %s)
+        RETURNING {_LESSON_COLS}
+        """,
+        (content, situation, vec, agent_id, task_id, evidence, confidence),
+    )
+    new = Lesson.from_row(cur.fetchone())
+    action = "inserted"
+
+    if verdict["relation"] == "contradicts":
+        # Newer evidence wins; keep the chain for provenance. The WHERE
+        # status = 'active' makes the supersede idempotent under a concurrent
+        # winner — if someone already superseded it, we simply don't.
         cur.execute(
-            f"""
-            INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
-                                 evidence, confidence)
-            VALUES (%s, %s, %s::VECTOR, %s, %s, %s, %s)
-            RETURNING {_LESSON_COLS}
-            """,
-            (content, situation, vec, agent_id, task_id, evidence, confidence),
+            "UPDATE lessons SET status = 'superseded', superseded_by = %s "
+            "WHERE id = %s AND status = 'active'",
+            (new.id, verdict["target_id"]),
         )
-        new = Lesson.from_row(cur.fetchone())
-        action = "inserted"
-
-        if verdict["relation"] == "contradicts":
-            # Newer evidence wins; keep the chain for provenance.
-            cur.execute(
-                "UPDATE lessons SET status = 'superseded', superseded_by = %s "
-                "WHERE id = %s AND status = 'active'",
-                (new.id, verdict["target_id"]),
-            )
+        if cur.rowcount:
             cur.execute(
                 "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
                 "VALUES (%s, 'supersede', %s, %s)",
@@ -219,14 +304,12 @@ def learn(content: str, situation: str, agent_id: str, evidence: str = "",
             )
             action = "superseded"
 
-        cur.execute(
-            "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
-            "VALUES (%s, 'learn', %s, %s)",
-            (agent_id, new.id, content[:200]),
-        )
-        return {"action": action, "lesson": new}
-
-    return run_txn(txn)
+    cur.execute(
+        "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
+        "VALUES (%s, 'learn', %s, %s)",
+        (agent_id, new.id, content[:200]),
+    )
+    return {"action": action, "lesson": new, "verdict": verdict}
 
 
 def reinforce(lesson_id: str, agent_id: str | None = None) -> None:

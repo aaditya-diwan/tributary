@@ -43,6 +43,11 @@ regression gate compares one key metric per suite against `evals/baseline.json`
   lessons wrongly blocked — currently 0.0). The full write-path enforcement
   (quarantine + recall exclusion + privilege separation + curator disputes)
   is covered by `tests/test_injection.py`.
+- **agent** — tool discipline for the ReAct agent (`agents/react_runner.py`),
+  live-only. Runs the agent on an ops task (should call `tribal_recall`) and on
+  a self-contained compute task (should NOT — there's nothing tribal to know).
+  Metric `tool_discipline` = fraction of correct recall decisions across both.
+  Run: `python -m evals.run_eval --tier live --suite agent`.
 - **judge** — LLM-as-judge over golden distillations
   (`golden/distillation.jsonl`), each hand-labeled 1–5. The suite reports the
   judge's agreement with the human labels (exact, within-1, Pearson r) — the

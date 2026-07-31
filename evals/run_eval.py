@@ -39,6 +39,7 @@ KEY_METRIC = {
     "e2e": "pass_rate",
     "judge": "within1_agreement",
     "redteam": "block_rate",
+    "agent": "tool_discipline",
 }
 
 
@@ -330,6 +331,41 @@ def run_judge(tier: str, limit: int | None) -> dict:
     }
 
 
+def run_agent(tier: str, limit: int | None) -> dict:
+    """Tool discipline: the ReAct agent should recall on the ops task and
+    NOT recall on the self-contained compute task. Live-only (real agent)."""
+    from evals import _db
+    from agents.react_runner import run_react_agent
+    from gauntlet import Gauntlet
+    from gauntlet.compute import ComputeTask
+
+    _db.use_isolated_db()
+    _db.clear_lessons()
+
+    trials = limit or 1
+    deploy_recalls, compute_recalls, compute_correct = [], [], []
+    for _ in range(trials):
+        d = run_react_agent("eval-react-deploy", Gauntlet(), "Deploy the payments service.",
+                            verbose=(tier == "live"))
+        deploy_recalls.append(d["recalls"])
+        c = run_react_agent("eval-react-compute", ComputeTask(), ComputeTask.TASK,
+                            verbose=(tier == "live"))
+        compute_recalls.append(c["recalls"])
+        compute_correct.append(c["outcome"] == "SUCCESS")
+
+    used_on_ops = sum(r > 0 for r in deploy_recalls)
+    skipped_on_compute = sum(r == 0 for r in compute_recalls)
+    return {
+        "trials": trials,
+        "recalled_on_ops_task": round(used_on_ops / trials, 3),
+        "skipped_recall_on_compute_task": round(skipped_on_compute / trials, 3),
+        # One score: correct tool decision on both task types.
+        "tool_discipline": round((used_on_ops + skipped_on_compute) / (2 * trials), 3),
+        "compute_task_correct": round(sum(compute_correct) / trials, 3),
+        "avg_compute_recalls": round(sum(compute_recalls) / trials, 2),
+    }
+
+
 def run_redteam(tier: str, limit: int | None) -> dict:
     """Adversarial lesson-writes vs. the injection screen. Measures how many
     attacks are blocked and, separately, the false-positive rate on benign
@@ -370,12 +406,16 @@ SUITES = {
     "e2e": run_e2e,
     "judge": run_judge,
     "redteam": run_redteam,
+    "agent": run_agent,
 }
 DEFAULT_SUITES = {
     "offline": ["classification", "retrieval", "e2e", "redteam"],
     "live": ["classification", "retrieval", "judge", "redteam"],
 }
-DB_SUITES = {"retrieval", "e2e"}
+# 'agent' is live-only and slow (runs real agents) — invoke it explicitly with
+# --suite agent rather than in the default live sweep.
+DB_SUITES = {"retrieval", "e2e", "agent"}
+LIVE_ONLY_SUITES = {"judge", "agent"}
 
 
 # ------------------------------------------------------------- recording ---
@@ -449,8 +489,9 @@ def main():
     for s in suites:
         if s not in SUITES:
             sys.exit(f"unknown suite: {s} (choose from {list(SUITES)})")
-    if args.tier == "offline" and "judge" in suites:
-        sys.exit("the judge suite needs a real LLM — run it with --tier live")
+    if args.tier == "offline" and (LIVE_ONLY_SUITES & set(suites)):
+        sys.exit(f"these suites need a real LLM — run with --tier live: "
+                 f"{sorted(LIVE_ONLY_SUITES & set(suites))}")
     if not original_db_url and (DB_SUITES & set(suites)):
         print(f"note: no DATABASE_URL — skipping DB suites {sorted(DB_SUITES & set(suites))}")
         suites = [s for s in suites if s not in DB_SUITES]

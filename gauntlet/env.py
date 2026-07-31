@@ -13,17 +13,40 @@ memory sails through. Traps:
 """
 
 import json
+import random
 
 
 class Gauntlet:
-    def __init__(self):
+    def __init__(self, chaos: float = 0.0, seed: int | None = None):
+        """chaos: probability [0,1] that a tool call returns garbage or a
+        truncated result instead of its real one — a visible failure mode for
+        the agent to detect, distrust, and retry. Deterministic when `seed`
+        is set, so chaos runs are reproducible."""
         self.cache_cleared = False
         self.build_ok = False
         self.deployed_db_url = None
         self.deployed = False
         self.rate_limited = 0
         self.steps = 0
+        self.chaos = chaos
+        self.chaos_events = 0
+        self._rng = random.Random(seed)
         self.transcript: list[dict] = []
+
+    _GARBAGE = [
+        "\x00\x01� garbled response �\x02",
+        "ERROR ERROR ERROR ",  # truncated mid-word
+        "{'partial': tru",     # malformed JSON fragment
+        "504 Gateway Timeout upstream connect error or disconnect/reset",
+    ]
+
+    def _maybe_corrupt(self, name: str, result: str) -> str:
+        # `done` is never corrupted — corrupting the terminal call can't teach
+        # the agent anything and only wedges the loop.
+        if name != "done" and self.chaos and self._rng.random() < self.chaos:
+            self.chaos_events += 1
+            return self._rng.choice(self._GARBAGE)
+        return result
 
     # ---- tool schemas (Converse-style toolSpec format) ----
     TOOLS = [
@@ -66,7 +89,7 @@ class Gauntlet:
 
     def execute(self, name: str, args: dict) -> str:
         self.steps += 1
-        result = self._dispatch(name, args or {})
+        result = self._maybe_corrupt(name, self._dispatch(name, args or {}))
         self.transcript.append({"step": self.steps, "tool": name,
                                 "args": args, "result": result})
         return result

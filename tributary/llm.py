@@ -22,6 +22,12 @@ import time
 from tributary import config, costs, telemetry
 
 TIMEOUT_SECONDS = 120
+MAX_LLM_RETRIES = 2          # transient failures: timeout, non-zero exit, bad JSON
+LLM_BACKOFF_SECONDS = 1.0
+
+
+class LLMError(RuntimeError):
+    """A `claude -p` call failed after exhausting retries."""
 
 TOOL_LOOP_SCHEMA = {
     "type": "object",
@@ -55,22 +61,37 @@ def _run(prompt: str, system: str, json_schema: dict | None = None,
     ]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
-    start = time.time()
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "`claude` CLI not found on PATH — install Claude Code and log in "
-            "(claude auth) before running online."
-        )
-    if proc.returncode != 0:
-        raise RuntimeError(f"claude -p failed: {proc.stderr.strip()}")
-    result = json.loads(proc.stdout)
-    result["_elapsed_ms"] = int((time.time() - start) * 1000)
-    return result
+
+    last_err = None
+    for attempt in range(MAX_LLM_RETRIES + 1):
+        start = time.time()
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            # Missing binary is a config error, not transient — don't retry.
+            raise LLMError(
+                "`claude` CLI not found on PATH — install Claude Code and log in "
+                "(claude auth) before running online."
+            )
+        except subprocess.TimeoutExpired as e:
+            last_err = f"timed out after {TIMEOUT_SECONDS}s"
+        else:
+            if proc.returncode != 0:
+                last_err = f"exit {proc.returncode}: {proc.stderr.strip()[:300]}"
+            else:
+                try:
+                    result = json.loads(proc.stdout)
+                except json.JSONDecodeError:
+                    last_err = f"unparseable stdout: {proc.stdout[:200]!r}"
+                else:
+                    result["_elapsed_ms"] = int((time.time() - start) * 1000)
+                    return result
+        if attempt < MAX_LLM_RETRIES:
+            time.sleep(LLM_BACKOFF_SECONDS * (2**attempt))  # transient — back off and retry
+    raise LLMError(f"claude -p failed after {MAX_LLM_RETRIES + 1} attempts: {last_err}")
 
 
 def _log(result: dict, purpose: str, model: str, escalated: bool = False) -> None:

@@ -2,7 +2,7 @@
 
 Three pieces get deployed. The agents themselves run anywhere (your laptop for
 the demo, ECS if you want them cloud-resident) and use the headless Claude
-Code CLI for reasoning — what lives on AWS is the Gardener (Lambda) and the
+Code CLI for reasoning, what lives on AWS is the Gardener (Lambda) and the
 dashboard (App Runner).
 
 ```
@@ -19,7 +19,7 @@ Everything below assumes region `us-east-1`.
 
 ## Fast path: one command with CDK ⚡
 
-Steps 3–5 below are fully automated by the CDK app in `infra/` — it builds
+Steps 3–5 below are fully automated by the CDK app in `infra/`, it builds
 both Docker images, pushes them to ECR, and stands up the Lambda, the
 EventBridge schedule, and the App Runner service:
 
@@ -33,13 +33,13 @@ cdk deploy
 ```
 
 The stack outputs `DashboardUrl` (your public demo link) and the Gardener's
-function name. Redeploy after code changes with another `cdk deploy` — CDK
+function name. Redeploy after code changes with another `cdk deploy`, CDK
 rebuilds only what changed. Tear everything down with `cdk destroy`.
 
 Still manual, by nature: **step 1** (the CockroachDB cluster, via ccloud CLI).
 Do that, then `cdk deploy`, and skip to the checklist.
 
-The sections below are the manual equivalent — useful for understanding
+The sections below are the manual equivalent, useful for understanding
 what the stack creates, or if you'd rather not use CDK.
 
 ---
@@ -52,7 +52,7 @@ ccloud cluster create tributary --cloud AWS --region us-east-1
 ccloud cluster sql tributary --connection-url     # copy this into .env as DATABASE_URL
 ```
 
-(Record this step — using the agent-ready ccloud CLI is one of your sponsor-tool
+(Record this step, using the agent-ready ccloud CLI is one of your sponsor-tool
 credits. The exact create flags vary by plan; `ccloud cluster create --help`
 shows the current form, and the Cloud Console works too.)
 
@@ -67,7 +67,7 @@ python scripts/init_db.py
 - MCP Server: Cloud Console → your cluster → **MCP** → copy the config snippet
   into Claude Code (read-only mode is fine; it's for human curation).
 
-## 2. The model layer (local — nothing to deploy)
+## 2. The model layer (local, nothing to deploy)
 
 Agent reasoning and the lesson classifier run through the headless Claude
 Code CLI (`claude -p`), using whatever auth your local `claude` binary
@@ -79,7 +79,7 @@ pip install -e ".[embeddings]"
 claude --version        # confirm the CLI is installed and logged in
 ```
 
-Smoke test: `python scripts/run_demo.py` locally — this exercises the CLI,
+Smoke test: `python scripts/run_demo.py` locally, this exercises the CLI,
 the local embedder, the vector index, and the whole learn/recall loop end
 to end.
 
@@ -103,7 +103,7 @@ docker push "$ECR/tributary-dashboard:latest"
 
 Then in the console (fastest path): **App Runner → Create service** →
 source: the ECR image → port **8080** → add environment variable
-`DATABASE_URL` → create. App Runner needs its default ECR access role —
+`DATABASE_URL` → create. App Runner needs its default ECR access role,
 accept the one it offers to create. Two minutes later you have a public
 HTTPS URL; that's the "functional demo app" link for the submission.
 
@@ -141,11 +141,11 @@ aws events put-targets --rule tributary-gardener-tick `
 ```
 
 (If the IAM role creation's escaped JSON fights PowerShell, create the role in
-the console instead — it's two clicks with the Lambda service trust.)
+the console instead, it's two clicks with the Lambda service trust.)
 
 ## 6. (Optional) Agents on ECS Fargate
 
-For the demo, running agents from your terminal is *better* — judges see them
+For the demo, running agents from your terminal is *better*, judges see them
 live, and the point is that unrelated processes share memory. If you want
 them cloud-resident anyway: build an image from the repo root that runs
 `python -m agents.runner --agent agent-a`, push to ECR, and run it as a
@@ -160,7 +160,7 @@ launched a minute apart make the same A-then-B demo, in the cloud.
 - [ ] App Runner URL loads the dashboard and the live feed updates during a run
 - [ ] `aws lambda invoke` on the Gardener returns `{"decayed": N, "retired": M}`
 - [ ] MCP Server connected in Claude Code (both the managed one and `mcp_server/`)
-- [ ] `.env` is NOT committed (it's gitignored — keep it that way)
+- [ ] `.env` is NOT committed (it's gitignored, keep it that way)
 - [ ] Architecture diagram includes: Lambda+EventBridge, App Runner,
       CockroachDB Cloud, MCP, the agents, and the local model layer
       (Claude Code CLI + sentence-transformers)

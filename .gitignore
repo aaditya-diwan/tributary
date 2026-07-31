@@ -10,4 +10,7 @@ build/
 .idea/
 .vscode/
 infra/cdk.out/
+evals/results/
+ccloud/
+ccloud.zip
 

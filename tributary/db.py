@@ -63,8 +63,17 @@ def vec_literal(embedding: list[float]) -> str:
 
 
 def init_schema() -> None:
+    """Apply schema.sql statement by statement (autocommit).
+
+    Statements run individually so idempotent migrations (ALTER TYPE ... ADD
+    VALUE IF NOT EXISTS, ALTER TABLE ... ADD COLUMN IF NOT EXISTS) can be
+    used by statements later in the same file — CockroachDB won't let a new
+    enum value or column be referenced inside the transaction that added it.
+    """
     schema = (Path(__file__).parent / "schema.sql").read_text()
+    statements = [s.strip() for s in schema.split(";") if s.strip()]
     with connect() as conn:
+        conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(schema)
-        conn.commit()
+            for stmt in statements:
+                cur.execute(stmt)

@@ -44,6 +44,19 @@ CREATE TABLE IF NOT EXISTS runs (
     at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Eval harness results, one row per suite run — the dashboard plots these
+-- over time so classification accuracy is a metric, not a demo.
+CREATE TABLE IF NOT EXISTS eval_results (
+    id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    git_sha  STRING,
+    tier     STRING NOT NULL,   -- offline | live
+    suite    STRING NOT NULL,   -- classification | retrieval | e2e | redteam | judge
+    metrics  JSONB NOT NULL,
+    at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS eval_results_at_idx ON eval_results (suite, at DESC);
+
 CREATE TABLE IF NOT EXISTS memory_audit (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     agent_id   UUID,

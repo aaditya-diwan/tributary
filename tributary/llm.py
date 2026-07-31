@@ -40,7 +40,8 @@ TOOL_LOOP_SCHEMA = {
 }
 
 
-def _run(prompt: str, system: str, json_schema: dict | None = None) -> dict:
+def _run(prompt: str, system: str, json_schema: dict | None = None,
+         model: str | None = None) -> dict:
     """Run `claude -p` headless and return the parsed --output-format json result."""
     cmd = [
         "claude", "-p", prompt,
@@ -49,7 +50,7 @@ def _run(prompt: str, system: str, json_schema: dict | None = None) -> dict:
         "--no-session-persistence",
         "--setting-sources", "",
         "--system-prompt", system,
-        "--model", config.CLAUDE_CODE_MODEL,
+        "--model", model or config.CLAUDE_CODE_MODEL,
     ]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
@@ -68,10 +69,19 @@ def _run(prompt: str, system: str, json_schema: dict | None = None) -> dict:
     return json.loads(proc.stdout)
 
 
-def complete(prompt: str, system: str | None = None) -> str:
+def complete(prompt: str, system: str | None = None, model: str | None = None) -> str:
     """Single-turn text completion."""
-    result = _run(prompt, system or "You are a helpful assistant.")
+    result = _run(prompt, system or "You are a helpful assistant.", model=model)
     return (result.get("result") or "").strip()
+
+
+def structured(prompt: str, system: str, schema: dict, model: str | None = None) -> dict:
+    """Single-turn completion constrained to a JSON schema (--json-schema).
+
+    Returns the validated structured output, or {} if the model produced none.
+    """
+    result = _run(prompt, system, json_schema=schema, model=model)
+    return result.get("structured_output") or {}
 
 
 def _tool_catalog(tools: list[dict]) -> str:

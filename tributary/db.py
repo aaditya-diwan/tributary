@@ -1,4 +1,4 @@
-"""CockroachDB connection handling and serializable-transaction retry."""
+"""PostgreSQL connection handling and serializable-transaction retry."""
 
 import time
 from pathlib import Path
@@ -7,21 +7,31 @@ import psycopg
 
 from tributary import config
 
-RETRYABLE_SQLSTATE = "40001"  # serialization failure — CRDB asks the client to retry
+RETRYABLE_SQLSTATE = "40001"  # serialization failure — Postgres asks the client to retry
 MAX_RETRIES = 5
 
 
 def connect() -> psycopg.Connection:
+    """Open a connection whose transactions run at SERIALIZABLE isolation.
+
+    Postgres defaults to READ COMMITTED, under which two agents learning
+    contradictory lessons at the same instant can both commit and leave the
+    tribe with a split brain. Setting the isolation level here (rather than
+    per-statement) means every transaction opened through this module gets
+    the guarantee, so a forgotten SET TRANSACTION can't silently downgrade it.
+    """
     if not config.DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set (see .env.example)")
-    return psycopg.connect(config.DATABASE_URL, application_name="tributary")
+    conn = psycopg.connect(config.DATABASE_URL, application_name="tributary")
+    conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE
+    return conn
 
 
 def run_txn(fn, retries: int = MAX_RETRIES):
     """Run `fn(cursor)` inside a serializable transaction, retrying on 40001.
 
-    CockroachDB runs SERIALIZABLE by default; concurrent conflicting writes
-    surface as a retryable error rather than silent lost updates. This is the
+    Under SERIALIZABLE, concurrent conflicting writes surface as a retryable
+    serialization failure rather than silent lost updates. This is the
     property Tributary leans on for conflict-safe shared memory.
     """
     from tributary import telemetry
@@ -56,8 +66,9 @@ def run_txn(fn, retries: int = MAX_RETRIES):
 def run_readonly(sql: str, params=()) -> list[tuple]:
     """Run a single read-only statement on an autocommit connection.
 
-    AS OF SYSTEM TIME queries must run outside an explicit transaction,
-    so time-travel reads go through here rather than run_txn.
+    Used for reads that don't need to participate in a write transaction
+    (candidate lookups that feed the classifier, time-travel queries,
+    dashboard stats), so they never hold serializable predicate locks.
     """
     with connect() as conn:
         conn.autocommit = True
@@ -67,8 +78,67 @@ def run_readonly(sql: str, params=()) -> list[tuple]:
 
 
 def vec_literal(embedding: list[float]) -> str:
-    """Render an embedding as a CockroachDB VECTOR literal string."""
+    """Render an embedding as a pgvector literal string ('[x,y,z]')."""
     return "[" + ",".join(f"{x:.7g}" for x in embedding) + "]"
+
+
+def _with_database(url: str, dbname: str) -> str:
+    """Return `url` pointing at `dbname` instead of its current database."""
+    base, _, query = url.partition("?")
+    server, _, _ = base.rpartition("/")
+    return f"{server}/{dbname}" + (f"?{query}" if query else "")
+
+
+def ensure_database(url: str, dbname: str) -> str:
+    """Create `dbname` on the server behind `url` if missing; return a URL
+    for it. Postgres has no CREATE DATABASE IF NOT EXISTS, so check first.
+    Used by the test and eval harnesses to get an isolated database."""
+    if not dbname.replace("_", "").isalnum():
+        raise ValueError(f"unsafe database name: {dbname!r}")
+    with psycopg.connect(url, autocommit=True) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (dbname,)
+        ).fetchone()
+        if not exists:
+            conn.execute(f'CREATE DATABASE "{dbname}"')
+    return _with_database(url, dbname)
+
+
+def split_statements(sql: str) -> list[str]:
+    """Split a SQL script into statements on ';', honouring $$-quoted bodies
+    (DO blocks, function bodies), single-quoted strings and `--` comments."""
+    statements, buf = [], []
+    i, n = 0, len(sql)
+    in_dollar = in_quote = False
+    while i < n:
+        ch = sql[i]
+        if in_dollar:
+            if sql.startswith("$$", i):
+                buf.append("$$"); i += 2; in_dollar = False
+            else:
+                buf.append(ch); i += 1
+        elif in_quote:
+            buf.append(ch); i += 1
+            if ch == "'":
+                in_quote = False
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j == -1 else j  # drop the comment, keep the newline
+        elif sql.startswith("$$", i):
+            buf.append("$$"); i += 2; in_dollar = True
+        elif ch == "'":
+            buf.append(ch); i += 1; in_quote = True
+        elif ch == ";":
+            stmt = "".join(buf).strip()
+            if stmt:
+                statements.append(stmt)
+            buf = []; i += 1
+        else:
+            buf.append(ch); i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
 def init_schema() -> None:
@@ -76,25 +146,12 @@ def init_schema() -> None:
 
     Statements run individually so idempotent migrations (ALTER TYPE ... ADD
     VALUE IF NOT EXISTS, ALTER TABLE ... ADD COLUMN IF NOT EXISTS) can be
-    used by statements later in the same file — CockroachDB won't let a new
-    enum value or column be referenced inside the transaction that added it.
+    used by statements later in the same file — Postgres won't let a new
+    enum value be referenced inside the transaction that added it.
     """
     raw = (Path(__file__).parent / "schema.sql").read_text()
-    # Strip `--` line comments before splitting on ';' so a semicolon inside a
-    # comment doesn't get mistaken for a statement terminator.
-    schema = "\n".join(line.split("--", 1)[0] for line in raw.splitlines())
-    statements = [s.strip() for s in schema.split(";") if s.strip()]
     with connect() as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
-            # Vector indexes are a preview feature gated behind a cluster
-            # setting. Cloud clusters enable it by default; a fresh self-hosted
-            # node does not. Best-effort enable it so `CREATE VECTOR INDEX`
-            # below works — ignore the failure when the connecting role lacks
-            # admin (e.g. Cloud, where it's already on anyway).
-            try:
-                cur.execute("SET CLUSTER SETTING feature.vector_index.enabled = true")
-            except psycopg.Error:
-                pass  # not permitted (Cloud) — already enabled there anyway
-            for stmt in statements:
+            for stmt in split_statements(raw):
                 cur.execute(stmt)

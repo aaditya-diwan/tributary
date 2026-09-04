@@ -19,7 +19,7 @@ from tributary import guard, memory
 from tributary.db import run_readonly, run_txn
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="needs a CockroachDB cluster"
+    not os.environ.get("DATABASE_URL"), reason="needs a Postgres database"
 )
 
 ATTACKS = [
@@ -91,7 +91,7 @@ def test_writer_contradicting_another_agent_is_disputed_not_superseded():
     assert second["action"] == "disputed", second["action"]
 
     def statuses(cur):
-        cur.execute("SELECT id::STRING, status::STRING FROM lessons WHERE id = ANY(%s)",
+        cur.execute("SELECT id::TEXT, status::TEXT FROM lessons WHERE id = ANY(%s)",
                     ([first["lesson"].id, second["lesson"].id],))
         return dict(cur.fetchall())
 

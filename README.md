@@ -1,10 +1,10 @@
 # 🌊 Tributary
 
-**Shared, persistent, conflict-safe memory for AI agents, built on CockroachDB and AWS.**
+**Shared, persistent, conflict-safe memory for AI agents, on PostgreSQL + pgvector.**
 
 Every agent's learnings flow into one shared river of memory. When one agent learns a lesson, every agent, current or future, related or not, knows it instantly. Agents are born knowing what the tribe knows, and die leaving the tribe smarter.
 
-> Built for the CockroachDB × AWS Hackathon.
+> Started at the CockroachDB × AWS Hackathon; since ported to plain PostgreSQL so it runs anywhere Postgres does.
 
 ## The problem
 
@@ -16,11 +16,11 @@ Tributary is a memory layer, not a framework. Agents call four functions:
 
 | Call | What happens |
 |---|---|
-| `recall(query)` | Semantic search (CockroachDB **vector index**) over the tribe's active lessons |
+| `recall(query)` | Semantic search (pgvector **HNSW index**, cosine) over the tribe's active lessons |
 | `learn(content, situation)` | One **serializable transaction**: embed → find similar lessons → LLM classifies *duplicate / contradicts / novel* → reinforce, supersede, or insert |
 | `reinforce(id)` | A recalled lesson actually helped, confidence goes up |
 | `retire(id)` | Curation (agents, the Gardener, or a human via the **MCP Server**) |
-| `recall_as_of(query, ts)` | 🕰️ **Time travel**: what would the tribe have recalled at a past instant? (CockroachDB `AS OF SYSTEM TIME`) |
+| `recall_as_of(query, ts)` | 🕰️ **Time travel**: what would the tribe have recalled at a past instant? (every lesson carries its validity interval) |
 
 Because every write is a serializable transaction, two agents learning contradictory facts *at the same instant* resolve deterministically, one lesson stays active, the other is superseded with a provenance chain. No lost updates, no split brain. That's why shared agent memory needs a real database, not a JSON file.
 
@@ -33,8 +33,8 @@ Because every write is a serializable transaction, two agents learning contradic
         agent-b ──┤── tributary lib: recall() / learn()
         agent-c ──┘        │
    (separate processes,    ▼
-    days apart, no IPC)  CockroachDB Cloud ◄── MCP Server ── Claude Code
-                         ├ lessons (VECTOR(1024) + vector index)   (human curation)
+    days apart, no IPC)  PostgreSQL + pgvector ◄── MCP Server ── Claude Code
+                         ├ lessons (vector(1024) + HNSW index)    (human curation)
                          ├ agents
                          └ memory_audit
                            ▲                 ▲
@@ -52,7 +52,9 @@ pip install -e ".[embeddings,dashboard,dev]"
 cp .env.example .env                             # fill in DATABASE_URL
 # agents use the `claude` CLI for reasoning, install Claude Code and log in
 
-python scripts/init_db.py                        # create schema + vector index
+# any Postgres 14+ with the pgvector extension; locally:
+docker run -d --name tributary-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=tributary -p 5432:5432 pgvector/pgvector:pg17
+python scripts/init_db.py                        # create schema + HNSW vector index
 python scripts/run_demo.py                       # the A-then-B demo
 uvicorn dashboard.app:app --reload               # dashboard at localhost:8000
 ```
@@ -74,7 +76,7 @@ shared memory with every other agent on your team:
 ```bash
 pip install -e ".[mcp]"
 claude mcp add tributary \
-    -e DATABASE_URL=<your-crdb-url> \
+    -e DATABASE_URL=<your-postgres-url> \
     -e TRIBUTARY_AGENT_NAME=alice-claude-code \
     -- python -m mcp_server.server
 ```
@@ -86,8 +88,11 @@ session, different machine, different repo, already knows it
 
 ### Time-travel memory 🕰️
 
-CockroachDB can read any table as it existed at a past instant, no
-snapshots, one SQL clause. Tributary uses it for belief forensics:
+Every lesson records the interval during which the tribe believed it
+(`activated_at`, `deactivated_at`), stamped inside the same transaction that
+inserts, supersedes, or retires it. So "what did the tribe believe at T?" is
+one `WHERE` clause, and unlike an MVCC "as of" read the history is never
+garbage-collected. Tributary uses it for belief forensics:
 
 ```python
 memory.recall_as_of("deploy api rate limits", "2026-07-10T15:42:00")
@@ -138,7 +143,12 @@ databases (created automatically), so fixture lessons, which carry fake
 offline embeddings, can never leak into the tribe's real memory. See
 [evals/README.md](evals/README.md) for the harness design.
 
-## Verified end-to-end run (2026-07-22)
+## Verified end-to-end run (2026-07-22, CockroachDB era)
+
+This run predates the PostgreSQL port. The write path, conflict tests, and
+demo are unchanged by the port (the offline suite and eval gate were re-run
+green against Postgres 17 + pgvector on 2026-09-04); the token/step numbers
+below are from the original run and have not been re-measured.
 
 The full pipeline was exercised against a real CockroachDB Cloud serverless
 cluster (v26.2.1, AWS us-east-1) with real `claude -p` reasoning and real
@@ -191,7 +201,7 @@ Two tiers (full design in [evals/README.md](evals/README.md)):
 - **offline**, deterministic (hash embeddings + heuristic classifier). This
   is the **CI regression gate** ([`.github/workflows/eval.yml`](.github/workflows/eval.yml)):
   every push runs the conflict + injection tests and the offline eval against a
-  single-node CockroachDB, and fails if a key metric drops below
+  Postgres + pgvector service container, and fails if a key metric drops below
   `evals/baseline.json`.
 - **live**, real embeddings + real `claude -p`. Produces the quality numbers
   that move as prompts/models change. Every run is written to the
@@ -278,11 +288,12 @@ happen to the existing one?", is a read-modify-write over shared state. Under
 eventual consistency (last-write-wins or CRDTs), two agents learning
 contradictory facts at the same instant both "win" and the tribe ends up with
 two active, contradictory lessons, a split brain that every future recall then
-spreads. CockroachDB's `SERIALIZABLE` default turns that race into a retryable
-40001 error, so exactly one lesson stays active and the other is superseded
-*with a provenance chain*. The cost is real, retries under contention and
-higher write latency across regions, but the supersede chain's correctness
-*is* the product, so it's the right place to spend it. A JSON file or a cache
+spreads. Running every write transaction at `SERIALIZABLE` (Postgres defaults
+to `READ COMMITTED`, so `db.connect()` sets it explicitly and a test pins it)
+turns that race into a retryable 40001 error, so exactly one lesson stays
+active and the other is superseded *with a provenance chain*. The cost is
+real, retries under contention, but the supersede chain's correctness *is*
+the product, so it's the right place to spend it. A JSON file or a cache
 cannot offer this.
 
 **Classification moved out of the transaction.** The first version ran the LLM
@@ -339,18 +350,31 @@ sweep (haiku-only vs tiered vs sonnet-only) end-to-end and publish the curve,
 the harness supports it, I just haven't spent the tokens; (4) add embedding-drift
 detection so a future embedding-model swap doesn't silently degrade recall.
 
-## How the sponsor tools are used
+## How Postgres is used
 
-**CockroachDB** (hackathon requires ≥2, we use all four):
+1. **pgvector HNSW index (cosine, partial).** Lessons are embedded (1024-d,
+   local sentence-transformers) into a `vector(1024)` column with an HNSW
+   index built with `vector_cosine_ops` over `WHERE status = 'active'`, so the
+   shipped `ORDER BY embedding <=> $q` query is an index scan (`EXPLAIN`
+   confirms it at 3k rows). The index is partial on purpose: HNSW returns its
+   nearest candidates *before* the status filter runs, so indexing dead
+   lessons too would let them crowd live ones out of the top-k. Vectors live
+   in the same transactional table as the lesson metadata, no sync gap
+   between embeddings and truth.
+2. **SERIALIZABLE transactions.** Postgres's serializable snapshot isolation
+   gives the same guarantee the design was built on: a concurrent
+   read-modify-write on the same candidate set fails with 40001 and is
+   retried, never silently lost.
+3. **Explicit temporal columns for time travel.** `activated_at` /
+   `deactivated_at` on every lesson, written in the same transaction as the
+   status change, replace the previous MVCC `AS OF SYSTEM TIME` read. Works
+   for any past instant, not just inside a retention window.
+4. **Runs anywhere.** Docker locally, RDS/Aurora, Neon, Supabase, or any
+   Postgres 14+ with the extension. No cluster settings, no custom CA.
 
-1. **Distributed Vector Indexing**, the core of `recall()`. Lessons are embedded (1024-d, local sentence-transformers) and stored in a `VECTOR(1024)` column with a `VECTOR INDEX`; agents retrieve tribal knowledge by semantic similarity (`<=>` cosine distance), so a paraphrased situation still finds the right lesson. Vectors live in the same transactional database as the lesson metadata, no sync gap between embeddings and truth. `AS OF SYSTEM TIME` on the same table gives time-travel recall for free.
-2. **Managed MCP Server**, humans supervise the tribe's memory from Claude Code: *"What has the tribe learned about the deploy API?"*, *"Which agent contributed the most helpful lessons?"*, *"Retire lesson X, it's outdated."* Configured from the Cloud Console (read-only mode + audit logging for safety). Tributary also ships its own MCP server (`mcp_server/`) so any MCP client can join the tribe as a first-class memory participant.
-3. **ccloud CLI**, used to provision the cluster, create the service account, and pull connection info (`ccloud cluster create`, `ccloud cluster sql --connection-url`).
-4. **Agent Skills Repo**, the schema and query patterns (enum status columns, vector index design, retry-on-40001) were built using the CockroachDB agent skills for schema/query design.
+**AWS** (optional, for the hosted pieces):
 
-**AWS:**
-
-1. **AWS Lambda + EventBridge**, the *Gardener* (`gardener/handler.py`) runs on a schedule: decays confidence of stale lessons and retires the withered ones, keeping shared memory trustworthy.
+1. **AWS Lambda + EventBridge**, the *Gardener* (`gardener/handler.py`) runs on a schedule: decays confidence of stale lessons and retires the withered ones, keeping shared memory trustworthy. (`pg_cron` is the Postgres-native alternative.)
 2. **AWS App Runner**, hosts the public dashboard (live memory feed, lesson browser, conflict counter) from `dashboard/Dockerfile`.
 
 (Agent reasoning + the lesson classifier run on the headless Claude Code CLI,
@@ -362,7 +386,7 @@ local sentence-transformers model.)
 ```
 tributary/           the memory library (the product)
   memory.py            recall / learn / reinforce / retire / dispute + privilege
-  db.py                CockroachDB connection + serializable-retry (traced)
+  db.py                Postgres connection (SERIALIZABLE) + 40001 retry (traced)
   embeddings.py        local sentence-transformers wrapper (+ offline mode)
   llm.py               headless Claude Code CLI, classifier, model tiering, retries
   guard.py             injection screen (untrusted-content boundary)
@@ -389,10 +413,10 @@ images, stands up Lambda + EventBridge + App Runner):
 
 ```powershell
 cd infra && pip install -r requirements.txt && cdk bootstrap
-$env:DATABASE_URL = "<your-crdb-url>"; cdk deploy   # outputs the dashboard URL
+$env:DATABASE_URL = "<your-postgres-url>"; cdk deploy   # outputs the dashboard URL
 ```
 
-Full walkthrough (cluster via ccloud CLI, manual
+Full walkthrough (database options, manual
 equivalents) in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## License

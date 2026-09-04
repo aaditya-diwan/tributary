@@ -32,7 +32,7 @@ regression gate compares one key metric per suite against `evals/baseline.json`
   true-paraphrase queries ("compiler keeps getting killed" → clear the build
   cache) are live-only, since hash embeddings can't do semantics. Metrics:
   hit@1, hit@5, MRR.
-- **e2e**, scripted write-path invariants against a real CockroachDB
+- **e2e**, scripted write-path invariants against a real Postgres
   (`tributary_eval` database, auto-created): duplicate→reinforce,
   contradiction→supersede with provenance, concurrent contradiction→exactly
   one active lesson. Offline-only so it's deterministic.

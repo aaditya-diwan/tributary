@@ -1,5 +1,28 @@
 # Tributary: Deep Dive
 
+> **Scope note (2026-09-04).** This document audits the **CockroachDB-era**
+> code at commit `cd88824`. The repository has since been ported to
+> PostgreSQL + pgvector. Everything about the write path, the classifier,
+> the guard, the evals, and the agents still holds. What changed:
+>
+> - **The vector index is now used.** §8/§12 found that the shipped cosine
+>   query (`<=>`) ignored the L2 `VECTOR INDEX`. The Postgres schema builds a
+>   partial HNSW index (`vector_cosine_ops`, `WHERE status = 'active'`);
+>   `EXPLAIN` on the shipped `recall()` query shows
+>   `Index Scan using lessons_active_embedding_idx` at 3k rows.
+> - **Time travel no longer uses `AS OF SYSTEM TIME`.** Lessons carry
+>   `activated_at` / `deactivated_at`, stamped in the same transaction as the
+>   status change, and `recall_as_of` filters on them (parameterized, so the
+>   §9 "SQL injection via AS OF" note is moot). The history is not bounded by
+>   a GC window.
+> - **Isolation is explicit.** Postgres defaults to READ COMMITTED;
+>   `db.connect()` sets SERIALIZABLE and `tests/test_conflicts.py` pins it.
+> - `STRING`→`TEXT`, `CREATE DATABASE IF NOT EXISTS`→`db.ensure_database`,
+>   the cluster-setting step is gone, CI runs a `pgvector/pgvector:pg17`
+>   service container.
+>
+> Line numbers cited below refer to `cd88824`, not to the current tree.
+
 A from-zero explanation of this repository, followed by the material you need to
 defend it under questioning.
 

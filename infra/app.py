@@ -7,11 +7,11 @@ both Docker images built and pushed automatically by CDK asset bundling.
     cd infra
     pip install -r requirements.txt
     cdk bootstrap                        # first time only, per account/region
-    $env:DATABASE_URL = "<crdb-url>"     # PowerShell (export ... on bash)
+    $env:DATABASE_URL = "<postgres-url>" # PowerShell (export ... on bash)
     cdk deploy
 
-Not automatable here: the CockroachDB cluster itself (ccloud CLI — see
-docs/DEPLOY.md).
+Not automatable here: the Postgres database itself (RDS, Neon, Supabase, or
+any Postgres with the pgvector extension — see docs/DEPLOY.md).
 
 Note: DATABASE_URL lands as a plain environment variable on both services,
 which is fine for a hackathon; the production path is Secrets Manager.
@@ -43,8 +43,8 @@ class TributaryStack(Stack):
         database_url = os.environ.get("DATABASE_URL", "")
         if not database_url:
             raise ValueError(
-                "Set DATABASE_URL before deploying (ccloud cluster sql "
-                "tributary --connection-url); see docs/DEPLOY.md"
+                "Set DATABASE_URL before deploying (a Postgres URL with the "
+                "pgvector extension available); see docs/DEPLOY.md"
             )
 
         # --- Gardener: Lambda container image + EventBridge schedule ---

@@ -33,7 +33,7 @@ def lambda_handler(event=None, context=None):
         # Retire lessons whose confidence has withered away.
         cur.execute(
             """
-            UPDATE lessons SET status = 'retired'
+            UPDATE lessons SET status = 'retired', deactivated_at = now()
             WHERE status = 'active' AND confidence < %s
             RETURNING id
             """,

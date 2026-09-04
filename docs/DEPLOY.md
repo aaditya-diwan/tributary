@@ -6,13 +6,14 @@ Code CLI for reasoning, what lives on AWS is the Gardener (Lambda) and the
 dashboard (App Runner).
 
 ```
-CockroachDB Cloud (on AWS us-east-1)  ← ccloud CLI
+PostgreSQL + pgvector (RDS/Neon/Supabase/any)  ← DATABASE_URL
 Lambda + EventBridge: the Gardener    ← container image from gardener/Dockerfile
 App Runner: the dashboard             ← container image from dashboard/Dockerfile
 ```
 
 Prereqs: AWS CLI configured (`aws configure`), Docker Desktop running,
-`ccloud` installed, and Claude Code installed + logged in (for the agents).
+a Postgres database with the pgvector extension, and Claude Code installed +
+logged in (for the agents).
 Everything below assumes region `us-east-1`.
 
 ---
@@ -28,7 +29,7 @@ npm install -g aws-cdk          # the CDK CLI (once)
 cd infra
 pip install -r requirements.txt
 cdk bootstrap                   # once per account/region
-$env:DATABASE_URL = "<your-crdb-url>"
+$env:DATABASE_URL = "<your-postgres-url>"
 cdk deploy
 ```
 
@@ -36,7 +37,7 @@ The stack outputs `DashboardUrl` (your public demo link) and the Gardener's
 function name. Redeploy after code changes with another `cdk deploy`, CDK
 rebuilds only what changed. Tear everything down with `cdk destroy`.
 
-Still manual, by nature: **step 1** (the CockroachDB cluster, via ccloud CLI).
+Still manual, by nature: **step 1** (the Postgres database).
 Do that, then `cdk deploy`, and skip to the checklist.
 
 The sections below are the manual equivalent, useful for understanding
@@ -44,28 +45,29 @@ what the stack creates, or if you'd rather not use CDK.
 
 ---
 
-## 1. CockroachDB Cloud cluster (via ccloud CLI)
+## 1. A Postgres database with pgvector
+
+Any Postgres 14+ where `CREATE EXTENSION vector` is allowed. Options:
+
+- **Local / CI:** `docker run -d -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=tributary -p 5432:5432 pgvector/pgvector:pg17`
+  → `DATABASE_URL=postgresql://postgres:postgres@localhost:5432/tributary` (the `.env.example` default)
+- **AWS RDS / Aurora PostgreSQL:** pgvector ships with PG 15.2+ / 16+; create
+  the instance, then `init_db.py` runs `CREATE EXTENSION IF NOT EXISTS vector`
+  (the master user has the privilege). Put the Lambda and App Runner service
+  in the same VPC, or make the instance publicly reachable with a security
+  group limited to their egress.
+- **Neon / Supabase:** both enable pgvector on request or by default; copy the
+  connection string (keep `sslmode=require`).
+
+Then create the schema:
 
 ```powershell
-ccloud auth login
-ccloud cluster create tributary --cloud AWS --region us-east-1
-ccloud cluster sql tributary --connection-url     # copy this into .env as DATABASE_URL
+python scripts/init_db.py      # idempotent: extension, tables, enum, HNSW index
 ```
 
-(Record this step, using the agent-ready ccloud CLI is one of your sponsor-tool
-credits. The exact create flags vary by plan; `ccloud cluster create --help`
-shows the current form, and the Cloud Console works too.)
-
-Then create the schema and enable the MCP Server:
-
-```powershell
-python scripts/init_db.py
-```
-
-- If you get a TLS error, download the cluster CA cert per the Console's
-  connection dialog and append `&sslrootcert=<path>` to `DATABASE_URL`.
-- MCP Server: Cloud Console → your cluster → **MCP** → copy the config snippet
-  into Claude Code (read-only mode is fine; it's for human curation).
+The schema is applied statement-by-statement in autocommit and every statement
+is guarded (`IF NOT EXISTS` / `ADD VALUE IF NOT EXISTS` / a `DO` block for the
+enum type), so re-running it on an existing database is a no-op.
 
 ## 2. The model layer (local, nothing to deploy)
 
@@ -80,7 +82,7 @@ claude --version        # confirm the CLI is installed and logged in
 ```
 
 Smoke test: `python scripts/run_demo.py` locally, this exercises the CLI,
-the local embedder, the vector index, and the whole learn/recall loop end
+the local embedder, the HNSW index, and the whole learn/recall loop end
 to end.
 
 ## 3. One-time: ECR login + repos
@@ -127,7 +129,7 @@ aws lambda create-function --function-name tributary-gardener `
   --package-type Image --code ImageUri="$ECR/tributary-gardener:latest" `
   --role "arn:aws:iam::${ACCT}:role/tributary-gardener-role" `
   --timeout 60 --memory-size 256 `
-  --environment "Variables={DATABASE_URL=<your-crdb-url>}"
+  --environment "Variables={DATABASE_URL=<your-postgres-url>}"
 
 aws lambda invoke --function-name tributary-gardener out.json; cat out.json   # smoke test
 
@@ -159,8 +161,8 @@ launched a minute apart make the same A-then-B demo, in the cloud.
 
 - [ ] App Runner URL loads the dashboard and the live feed updates during a run
 - [ ] `aws lambda invoke` on the Gardener returns `{"decayed": N, "retired": M}`
-- [ ] MCP Server connected in Claude Code (both the managed one and `mcp_server/`)
+- [ ] MCP Server connected in Claude Code (`mcp_server/`)
 - [ ] `.env` is NOT committed (it's gitignored, keep it that way)
 - [ ] Architecture diagram includes: Lambda+EventBridge, App Runner,
-      CockroachDB Cloud, MCP, the agents, and the local model layer
+      Postgres + pgvector, MCP, the agents, and the local model layer
       (Claude Code CLI + sentence-transformers)

@@ -1,12 +1,12 @@
 """Tributary MCP server — plug ANY agent into the tribe's shared memory.
 
 One config line gives Claude Code, Cursor, or any MCP-compatible client
-recall/learn access to the same CockroachDB-backed memory the autonomous
+recall/learn access to the same Postgres-backed memory the autonomous
 agents use. Two developers' coding agents share lessons instantly.
 
 Add to Claude Code:
 
-    claude mcp add tributary -e DATABASE_URL=<your-crdb-url> \
+    claude mcp add tributary -e DATABASE_URL=<your-postgres-url> \
         -e TRIBUTARY_AGENT_NAME=alice-claude-code \
         -- python -m mcp_server.server
 
@@ -93,8 +93,8 @@ def tribal_retire(lesson_id: str, reason: str = "") -> str:
 def tribal_recall_as_of(query: str, timestamp: str, k: int = 5) -> str:
     """Time-travel: what would the tribe have recalled for this query at a
     past instant? `timestamp` is ISO format (e.g. 2026-07-10T15:42:00).
-    Uses CockroachDB AS OF SYSTEM TIME — no snapshots needed. Great for
-    forensics: 'what did the agents believe when that decision was made?'"""
+    Uses each lesson's validity interval, so it works for any past instant.
+    Great for forensics: 'what did the agents believe when that decision was made?'"""
     hits = memory.recall_as_of(query, timestamp, k=k)
     return json.dumps([_lesson_dict(l) for l in hits], indent=2) if hits else \
         f"The tribe knew nothing relevant at {timestamp}."
@@ -105,7 +105,7 @@ def tribal_stats() -> str:
     """Overview of the tribe's memory: lesson counts, top contributors,
     recent conflict resolutions."""
     counts = run_readonly(
-        "SELECT status::STRING, count(*) FROM lessons GROUP BY status"
+        "SELECT status::TEXT, count(*) FROM lessons GROUP BY status"
     )
     contributors = run_readonly(
         """

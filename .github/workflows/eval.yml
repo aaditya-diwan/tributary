@@ -8,21 +8,22 @@ on:
 jobs:
   offline-eval:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
-
-      - name: Start single-node CockroachDB
-        run: |
-          docker run -d --name crdb -p 26257:26257 \
-            cockroachdb/cockroach:latest-v25.2 start-single-node --insecure
-          for i in $(seq 1 30); do
-            docker exec crdb ./cockroach sql --insecure -e 'SELECT 1' && break
-            sleep 2
-          done
-          # Vector indexes are a preview feature gated behind a cluster setting.
-          # Cloud clusters enable it by default; a fresh self-hosted node does not.
-          docker exec crdb ./cockroach sql --insecure \
-            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
 
       - uses: actions/setup-python@v5
         with:
@@ -31,13 +32,10 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
 
-      - name: Conflict + injection tests (offline, real CockroachDB)
+      - name: Conflict + injection tests (offline, real Postgres)
         env:
           TRIBUTARY_OFFLINE: "1"
-          DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
         run: pytest tests/ -v
 
       - name: Eval harness — offline tier, regression gate
-        env:
-          DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
         run: python -m evals.run_eval --tier offline --check-baseline

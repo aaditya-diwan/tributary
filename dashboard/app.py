@@ -19,7 +19,7 @@ def feed(limit: int = 50):
         cur.execute(
             """
             SELECT a.at, COALESCE(ag.name, 'system'), a.action,
-                   a.lesson_id::STRING, a.detail
+                   a.lesson_id::TEXT, a.detail
             FROM memory_audit a
             LEFT JOIN agents ag ON ag.id = a.agent_id
             ORDER BY a.at DESC LIMIT %s
@@ -33,8 +33,8 @@ def feed(limit: int = 50):
 
 @app.get("/api/lessons_as_of")
 def lessons_as_of(ts: str):
-    """Time-travel: the tribe's belief set at a past instant, via
-    CockroachDB AS OF SYSTEM TIME."""
+    """Time-travel: the tribe's belief set at a past instant, from each
+    lesson's [activated_at, deactivated_at) validity interval."""
     try:
         found = memory.lessons_as_of(ts)
     except ValueError:
@@ -54,11 +54,11 @@ def lessons(status: str = "active"):
     def txn(cur):
         cur.execute(
             """
-            SELECT l.id::STRING, l.situation, l.content, ag.name, l.confidence,
-                   l.times_recalled, l.times_helpful, l.status::STRING,
-                   l.superseded_by::STRING, l.created_at
+            SELECT l.id::TEXT, l.situation, l.content, ag.name, l.confidence,
+                   l.times_recalled, l.times_helpful, l.status::TEXT,
+                   l.superseded_by::TEXT, l.created_at
             FROM lessons l JOIN agents ag ON ag.id = l.agent_id
-            WHERE %s = 'all' OR l.status::STRING = %s
+            WHERE %s = 'all' OR l.status::TEXT = %s
             ORDER BY l.created_at DESC LIMIT 200
             """,
             (status, status),
@@ -157,7 +157,7 @@ PAGE = """<!doctype html><html><head><title>Tributary</title>
   .badge{font-size:11px;padding:1px 7px;border-radius:9px;background:#1c2c48;color:#8fb8e8;margin-left:6px}
 </style></head><body>
 <header><h1>🌊 <span>Tributary</span> — the tribe's shared memory</h1>
-<div class="sub">Backed by CockroachDB · lessons flow in from every agent, and never dry up</div></header>
+<div class="sub">Backed by PostgreSQL + pgvector · lessons flow in from every agent, and never dry up</div></header>
 <div class="stats" id="stats"></div>
 <div class="grid">
   <div class="card"><h2>Live memory feed</h2><div id="feed"></div></div>
@@ -170,13 +170,13 @@ PAGE = """<!doctype html><html><head><title>Tributary</title>
     <button onclick="travel()"
       style="background:#57b3ff;color:#0b1220;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font-weight:600">
       Look</button>
-    <div class="sub" style="margin-top:6px">Powered by CockroachDB AS OF SYSTEM TIME — no snapshots, just SQL.</div>
+    <div class="sub" style="margin-top:6px">Every lesson carries its validity interval, so the past is one WHERE clause away.</div>
     <div id="past"></div></div>
   <div class="card"><h2>💸 Cost &amp; latency — model tiering</h2>
     <div id="costs"><div class=sub>No LLM calls logged yet (run online, not offline).</div></div></div>
   <div class="card"><h2>📈 Classification accuracy over commits (eval harness)</h2>
     <svg id="evalcurve" viewBox="0 0 400 150" style="width:100%"></svg>
-    <div class="sub">The metric that moves — each point is one eval run recorded to CockroachDB.</div></div>
+    <div class="sub">The metric that moves — each point is one eval run recorded to Postgres.</div></div>
 </div>
 <script>
 function lessonHtml(l){
@@ -184,8 +184,10 @@ function lessonHtml(l){
     `<span class=badge>conf ${l.confidence.toFixed(2)}</span></div>`;
 }
 async function travel(){
-  const ts = document.getElementById('ts').value;
-  if(!ts) return;
+  const local = document.getElementById('ts').value;
+  if(!local) return;
+  // datetime-local is naive browser-local time; send an absolute UTC instant.
+  const ts = new Date(local).toISOString();
   const past = await fetch('/api/lessons_as_of?ts='+encodeURIComponent(ts)).then(r=>r.json());
   document.getElementById('past').innerHTML = past.error ? past.error :
     (past.length ? past.map(lessonHtml).join('') :

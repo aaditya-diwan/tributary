@@ -31,7 +31,7 @@ def main():
     run_agent("immune-agent", "Deploy the payments service")
 
     rows = run_readonly(
-        "SELECT status::STRING, superseded_by::STRING, content FROM lessons WHERE id = %s",
+        "SELECT status::TEXT, superseded_by::TEXT, content FROM lessons WHERE id = %s",
         (poison["lesson"].id,),
     )
     status, superseded_by, content = rows[0]

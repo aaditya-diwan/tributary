@@ -126,8 +126,8 @@ def _seed_corpus(lessons: list[dict]) -> None:
     def txn(cur):
         for l in lessons:
             cur.execute(
-                "INSERT INTO lessons (content, situation, embedding, agent_id, confidence) "
-                "VALUES (%s, %s, %s::VECTOR, %s, 0.8)",
+                "INSERT INTO lessons (content, situation, embedding, agent_id, confidence, "
+                "activated_at) VALUES (%s, %s, %s::vector, %s, 0.8, now())",
                 (l["content"], l["situation"],
                  vec_literal(embed(f"{l['situation']}: {l['content']}")), agent_id),
             )
@@ -191,7 +191,7 @@ def run_e2e(tier: str, limit: int | None) -> dict:
 
     def statuses(ids):
         def txn(cur):
-            cur.execute("SELECT id::STRING, status::STRING, superseded_by::STRING "
+            cur.execute("SELECT id::TEXT, status::TEXT, superseded_by::TEXT "
                         "FROM lessons WHERE id = ANY(%s)", (ids,))
             return {r[0]: (r[1], r[2]) for r in cur.fetchall()}
         return run_txn(txn)

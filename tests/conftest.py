@@ -18,23 +18,13 @@ from tributary import config, db
 TEST_DB = "tributary_test"
 
 
-def _with_database(url: str, dbname: str) -> str:
-    base, _, query = url.partition("?")
-    server, _, _ = base.rpartition("/")
-    return f"{server}/{dbname}" + (f"?{query}" if query else "")
-
-
 @pytest.fixture(scope="session", autouse=True)
 def test_database():
     if not config.DATABASE_URL:
         yield  # individual tests skip themselves via their skipif marker
         return
     original = config.DATABASE_URL
-    import psycopg
-
-    with psycopg.connect(original, autocommit=True) as conn:
-        conn.execute(f"CREATE DATABASE IF NOT EXISTS {TEST_DB}")
-    config.DATABASE_URL = _with_database(original, TEST_DB)
+    config.DATABASE_URL = db.ensure_database(original, TEST_DB)
     db.init_schema()
     # Start from an empty tribe every session. Fixtures use unique markers, but
     # the offline heuristic classifier matches on the *other* words, so a lesson

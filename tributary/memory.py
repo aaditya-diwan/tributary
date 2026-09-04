@@ -1,14 +1,20 @@
 """The Tributary memory API: recall / learn / reinforce / retire.
 
-All writes run as serializable transactions against CockroachDB. When two
+All writes run as SERIALIZABLE transactions against PostgreSQL. When two
 agents learn contradictory things at the same instant, one transaction
 retries against the other's committed result — no lost updates, no split
 brain. That property is the whole reason shared agent memory needs a real
 database underneath it.
+
+Time travel (recall_as_of / lessons_as_of) is explicit rather than an MVCC
+"as of" read: every lesson carries [activated_at, deactivated_at), the
+interval during which it was part of the tribe's belief set. That history is
+never garbage-collected, so forensics work months later, not just within a
+retention window.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from tributary import guard, llm, telemetry
 from tributary.db import run_readonly, run_txn, vec_literal
@@ -102,10 +108,10 @@ def recall(query: str, agent_id: str | None = None, k: int = 5,
     def txn(cur):
         cur.execute(
             f"""
-            SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
+            SELECT {_LESSON_COLS}, embedding <=> %s::vector AS distance
             FROM lessons
             WHERE status = 'active' AND confidence >= %s
-            ORDER BY embedding <=> %s::VECTOR
+            ORDER BY embedding <=> %s::vector
             LIMIT %s
             """,
             (qvec, min_confidence, qvec, k),
@@ -127,45 +133,51 @@ def recall(query: str, agent_id: str | None = None, k: int = 5,
     return run_txn(txn)
 
 
-def _as_of_clause(timestamp: str | datetime) -> str:
-    """Validate a timestamp and render an AS OF SYSTEM TIME clause.
+def _parse_ts(timestamp: str | datetime) -> datetime:
+    """Validate a timestamp for a time-travel read (raises ValueError).
 
-    CockroachDB can read any table as it existed at a past instant — no
-    snapshots, no extra tables. Tributary uses it for time-travel memory:
-    "what did the tribe believe at 3:42pm yesterday?"
-    """
+    A naive timestamp is taken as UTC, so the result doesn't depend on the
+    database server's TimeZone setting."""
     ts = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(timestamp)
-    return f"AS OF SYSTEM TIME '{ts.isoformat()}'"
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+
+# A lesson was believed at instant T iff it had been activated by T and had
+# not yet been superseded/retired. Quarantined and rejected lessons never get
+# an activated_at, so they are never part of any past belief set either.
+_BELIEVED_AT = "activated_at <= %s AND (deactivated_at IS NULL OR deactivated_at > %s)"
 
 
 def recall_as_of(query: str, timestamp: str | datetime, k: int = 5) -> list[Lesson]:
     """What would recall() have returned at `timestamp`? Read-only; leaves
     no trace in usage counters — this is forensics, not memory access."""
+    ts = _parse_ts(timestamp)
     qvec = vec_literal(embed(query))
     rows = run_readonly(
         f"""
-        SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
-        FROM lessons {_as_of_clause(timestamp)}
-        WHERE status = 'active'
-        ORDER BY embedding <=> %s::VECTOR
+        SELECT {_LESSON_COLS}, embedding <=> %s::vector AS distance
+        FROM lessons
+        WHERE {_BELIEVED_AT}
+        ORDER BY embedding <=> %s::vector
         LIMIT %s
         """,
-        (qvec, qvec, k),
+        (qvec, ts, ts, qvec, k),
     )
     return [Lesson.from_row(r) for r in rows]
 
 
 def lessons_as_of(timestamp: str | datetime, limit: int = 200) -> list[Lesson]:
     """The tribe's full active belief set as it existed at `timestamp`."""
+    ts = _parse_ts(timestamp)
     rows = run_readonly(
         f"""
         SELECT {_LESSON_COLS}
-        FROM lessons {_as_of_clause(timestamp)}
-        WHERE status = 'active'
+        FROM lessons
+        WHERE {_BELIEVED_AT}
         ORDER BY created_at DESC
         LIMIT %s
         """,
-        (limit,),
+        (ts, ts, limit),
     )
     return [Lesson.from_row(r) for r in rows]
 
@@ -180,10 +192,10 @@ def _fetch_candidates(vec: str) -> list[Lesson]:
     """
     rows = run_readonly(
         f"""
-        SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
+        SELECT {_LESSON_COLS}, embedding <=> %s::vector AS distance
         FROM lessons
         WHERE status = 'active'
-        ORDER BY embedding <=> %s::VECTOR
+        ORDER BY embedding <=> %s::vector
         LIMIT %s
         """,
         (vec, vec, CANDIDATE_K),
@@ -275,7 +287,7 @@ def _quarantine(content, situation, vec, agent_id, task_id, evidence, reasons) -
             f"""
             INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
                                  evidence, confidence, status)
-            VALUES (%s, %s, %s::VECTOR, %s, %s, %s, 0.0, 'quarantined')
+            VALUES (%s, %s, %s::vector, %s, %s, %s, 0.0, 'quarantined')
             RETURNING {_LESSON_COLS}
             """,
             (content, situation, vec, agent_id, task_id, evidence),
@@ -312,10 +324,10 @@ def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confid
     """
     cur.execute(
         f"""
-        SELECT {_LESSON_COLS}, embedding <=> %s::VECTOR AS distance
+        SELECT {_LESSON_COLS}, embedding <=> %s::vector AS distance
         FROM lessons
         WHERE status = 'active'
-        ORDER BY embedding <=> %s::VECTOR
+        ORDER BY embedding <=> %s::vector
         LIMIT %s
         """,
         (vec, vec, CANDIDATE_K),
@@ -368,7 +380,7 @@ def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confid
             f"""
             INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
                                  evidence, confidence, status)
-            VALUES (%s, %s, %s::VECTOR, %s, %s, %s, %s, 'disputed')
+            VALUES (%s, %s, %s::vector, %s, %s, %s, %s, 'disputed')
             RETURNING {_LESSON_COLS}
             """,
             (content, situation, vec, agent_id, task_id, evidence, confidence),
@@ -385,8 +397,8 @@ def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confid
     cur.execute(
         f"""
         INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
-                             evidence, confidence)
-        VALUES (%s, %s, %s::VECTOR, %s, %s, %s, %s)
+                             evidence, confidence, activated_at)
+        VALUES (%s, %s, %s::vector, %s, %s, %s, %s, now())
         RETURNING {_LESSON_COLS}
         """,
         (content, situation, vec, agent_id, task_id, evidence, confidence),
@@ -399,8 +411,8 @@ def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confid
         # status = 'active' makes the supersede idempotent under a concurrent
         # winner — if someone already superseded it, we simply don't.
         cur.execute(
-            "UPDATE lessons SET status = 'superseded', superseded_by = %s "
-            "WHERE id = %s AND status = 'active'",
+            "UPDATE lessons SET status = 'superseded', superseded_by = %s, "
+            "deactivated_at = now() WHERE id = %s AND status = 'active'",
             (new.id, verdict["target_id"]),
         )
         if cur.rowcount:
@@ -450,7 +462,12 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> Non
                 (agent_id, f"retire {lesson_id}: curator role required"),
             )
             raise PrivilegeError("retiring a lesson requires the curator role")
-        cur.execute("UPDATE lessons SET status = 'retired' WHERE id = %s", (lesson_id,))
+        cur.execute(
+            "UPDATE lessons SET status = 'retired', "
+            "deactivated_at = COALESCE(deactivated_at, CASE WHEN status = 'active' THEN now() END) "
+            "WHERE id = %s",
+            (lesson_id,),
+        )
         cur.execute(
             "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
             "VALUES (%s, 'retire', %s, %s)",
@@ -482,7 +499,8 @@ def resolve_dispute(lesson_id: str, curator_id: str, accept: bool) -> dict:
             return {"action": "rejected", "lesson": lesson}
         # Accept: find the active lesson it contradicts and supersede it.
         cur.execute(
-            "UPDATE lessons SET status = 'active' WHERE id = %s", (lesson_id,))
+            "UPDATE lessons SET status = 'active', activated_at = now() WHERE id = %s",
+            (lesson_id,))
         cur.execute(
             "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
             "VALUES (%s, 'dispute-accept', %s, 'activated by curator')",

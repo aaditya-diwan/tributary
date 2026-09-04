@@ -3,7 +3,7 @@
 Two tiers:
 
 - ``offline`` — deterministic (hash embeddings + heuristic classifier).
-  Runs in CI on every push against a single-node CockroachDB; catches
+  Runs in CI on every push against a Postgres (pgvector) container; catches
   regressions in the memory pipeline itself (gate logic, transaction
   semantics, retrieval plumbing).
 - ``live`` — real embeddings + real LLM classification. Produces the

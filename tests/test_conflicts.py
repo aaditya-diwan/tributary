@@ -1,9 +1,9 @@
 """The headline test: two agents learn contradictory lessons CONCURRENTLY,
-and CockroachDB's serializable isolation guarantees a deterministic outcome —
+and SERIALIZABLE isolation guarantees a deterministic outcome —
 exactly one lesson stays active, the other is superseded with a provenance
 chain. No lost updates, no split brain.
 
-Requires DATABASE_URL (a real CockroachDB cluster). Runs offline from AWS:
+Requires DATABASE_URL (a real Postgres with pgvector). Runs offline from AWS:
 
     TRIBUTARY_OFFLINE=1 pytest tests/test_conflicts.py -v
 """
@@ -20,7 +20,7 @@ from tributary import memory
 from tributary.db import run_txn
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="needs a CockroachDB cluster"
+    not os.environ.get("DATABASE_URL"), reason="needs a Postgres database"
 )
 
 
@@ -36,11 +36,21 @@ def agents():
 def _statuses(ids):
     def txn(cur):
         cur.execute(
-            "SELECT id::STRING, status::STRING, superseded_by::STRING "
+            "SELECT id::TEXT, status::TEXT, superseded_by::TEXT "
             "FROM lessons WHERE id = ANY(%s)", (ids,),
         )
         return {r[0]: (r[1], r[2]) for r in cur.fetchall()}
     return run_txn(txn)
+
+
+def test_transactions_run_serializable():
+    """Postgres defaults to READ COMMITTED, under which every other test in
+    this file could still pass while the conflict-safety guarantee is gone.
+    Pin the isolation level the write path actually runs at."""
+    def txn(cur):
+        cur.execute("SELECT current_setting('transaction_isolation')")
+        return cur.fetchone()[0]
+    assert run_txn(txn) == "serializable"
 
 
 def test_concurrent_contradiction_resolves_deterministically(agents):

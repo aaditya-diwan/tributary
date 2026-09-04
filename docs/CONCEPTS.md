@@ -77,12 +77,15 @@ slow. A vector index organises vectors so you can find the closest few quickly,
 trading a little accuracy for a lot of speed (approximate nearest neighbour).
 
 Why it matters here: `recall()` runs a nearest-neighbour search over the
-`embedding` column using CockroachDB's `VECTOR INDEX` and the `<=>` cosine
-distance operator. See `tributary/schema.sql` and `recall()` in
+`embedding` column using a pgvector HNSW index built with `vector_cosine_ops`
+and the `<=>` cosine distance operator. Two details matter: the opclass (an
+index built for L2 distance is ignored by a cosine query), and the fact that
+an ANN index returns its nearest candidates *before* any `WHERE` filter, so
+the index is partial over `status = 'active'` to keep dead lessons from
+crowding out live ones. See `tributary/schema.sql` and `recall()` in
 `tributary/memory.py`.
 
-Read: "approximate nearest neighbour search", "HNSW", "pgvector", CockroachDB
-vector index docs.
+Read: "approximate nearest neighbour search", "HNSW", the pgvector README.
 
 ---
 
@@ -118,9 +121,11 @@ Why it matters here: this is the whole reason Tributary needs a serious
 database. Two agents can learn contradictory facts at the very same instant
 ("use port 8080" and "use port 9090"). Under a weak isolation level both writes
 "win" and the tribe ends up with two active, contradictory lessons, a split
-brain that every future recall then spreads. CockroachDB runs SERIALIZABLE by
-default, so exactly one lesson stays active and the other is superseded. See
-`tests/test_conflicts.py` for the test that proves this.
+brain that every future recall then spreads. Postgres defaults to READ
+COMMITTED, which permits exactly that, so `db.connect()` sets every
+connection to SERIALIZABLE and `test_transactions_run_serializable` pins it.
+Then exactly one lesson stays active and the other is superseded. See
+`tests/test_conflicts.py` for the tests that prove this.
 
 Read: "SQL isolation levels", "serializable isolation", "write skew".
 
@@ -136,32 +141,33 @@ Why it matters here: `run_txn` in `tributary/db.py` catches `40001` and retries
 with backoff. The number of retries is the visible cost of the safety
 guarantee, which is exactly why the OpenTelemetry span records the retry count.
 
-Read: "optimistic concurrency control", "CockroachDB transaction retries".
+Read: "optimistic concurrency control", "serializable snapshot isolation (SSI)", the Postgres docs on transaction isolation.
 
-### 2.4 MVCC and time-travel queries
+### 2.4 Temporal columns and time-travel queries
 
-Multi-Version Concurrency Control (MVCC) means the database keeps older versions
-of each row for a while instead of overwriting in place. A side benefit: you can
-ask "what did this table look like at 3:42pm yesterday?" and get a consistent
-answer with no snapshots and no extra tables.
+Some databases can read a table "as of" a past instant from their MVCC
+history, but only within a retention window, after which old versions are
+garbage-collected. The durable alternative is to make validity explicit: each
+row records the interval during which it was true, written in the same
+transaction as the change that made it true or false.
 
-Why it matters here: `recall_as_of()` uses CockroachDB's `AS OF SYSTEM TIME`
-clause for "belief forensics", what did the tribe believe before some discovery
-superseded it? See `recall_as_of` and `lessons_as_of` in `tributary/memory.py`.
-Time-travel reads must run outside a normal transaction, which is why they go
-through `run_readonly`.
+Why it matters here: every lesson carries `activated_at` and
+`deactivated_at`. `learn` stamps `activated_at` on insert, and supersede /
+retire stamp `deactivated_at`, atomically with the status change. So
+`recall_as_of()` is just `WHERE activated_at <= T AND (deactivated_at IS NULL
+OR deactivated_at > T)`, "belief forensics" for any T, ever. See
+`recall_as_of` and `lessons_as_of` in `tributary/memory.py`.
 
-Read: "MVCC", "CockroachDB AS OF SYSTEM TIME", "temporal queries".
+Read: "temporal tables", "system-versioned tables", "bitemporal data".
 
-### 2.5 Distributed SQL
+### 2.5 One database, many processes
 
-CockroachDB is a distributed SQL database: it spreads data across many nodes
-(and regions) while still offering a single logical SQL database with
-serializable transactions. That is what makes shared memory work across
-machines and survive node failures.
-
-Read: "distributed SQL", "NewSQL", the CockroachDB architecture docs, and the
-Spanner paper (Google) that inspired this class of system.
+Every agent, the MCP server, the Gardener, and the dashboard talk to the same
+Postgres. That is what makes memory shared across machines: no IPC, no
+message bus, the database is the rendezvous point. Postgres scales this with
+read replicas and managed HA (RDS Multi-AZ, Neon, etc.); the write path is
+single-primary, which is fine because the serializable read-modify-write in
+`learn` is the thing that must not be split.
 
 ---
 

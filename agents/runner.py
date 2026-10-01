@@ -18,15 +18,32 @@ import time
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from tributary import llm, memory, runs
+from tributary import llm, log, memory, runs
 from agents import prompts
 from gauntlet import Gauntlet
 
 MAX_STEPS = 25
 
+logger = log.get_logger(__name__)
+
 
 def run_agent(agent_name: str, task: str, use_memory: bool = True,
               generation: int | None = None) -> dict:
+    """Run one agent on a task. The printed narration on stdout is the demo;
+    the structured log on stderr (tagged with the agent's name) is how you
+    see what the memory layer did underneath it."""
+    with log.context(agent=agent_name):
+        logger.info("agent run start", task=log.preview(task, 80),
+                    use_memory=use_memory, generation=generation)
+        stats = _run_agent(agent_name, task, use_memory, generation)
+        logger.info("agent run end", outcome=stats["outcome"], steps=stats["steps"],
+                    tokens=stats["tokens"], recalled=stats["recalled"],
+                    seconds=stats["seconds"])
+        return stats
+
+
+def _run_agent(agent_name: str, task: str, use_memory: bool,
+               generation: int | None) -> dict:
     agent_id = memory.ensure_agent(agent_name)
     env = Gauntlet()
 
@@ -110,11 +127,15 @@ def _distill_and_learn(agent_id, task, outcome, recalled, env):
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         print("    (distillation produced no JSON — skipping)")
+        logger.warning("distillation produced no JSON; no lessons learned",
+                       reply=log.preview(raw, 200))
         return
     try:
         distilled = json.loads(match.group(0))
     except json.JSONDecodeError:
         print("    (distillation JSON invalid — skipping)")
+        logger.warning("distillation JSON invalid; no lessons learned",
+                       reply=log.preview(match.group(0), 200))
         return
 
     for l in distilled.get("new_lessons", []):
@@ -139,4 +160,5 @@ def main():
 
 
 if __name__ == "__main__":
+    log.setup()
     main()

@@ -22,7 +22,7 @@ import time
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from tributary import llm, memory, telemetry
+from tributary import llm, log, memory, telemetry
 from agents import prompts
 from agents.tools import MEMORY_TOOLS, MEMORY_TOOL_NAMES, MemoryTools
 from gauntlet import Gauntlet
@@ -30,9 +30,26 @@ from gauntlet.compute import ComputeTask
 
 MAX_STEPS = 25
 
+logger = log.get_logger(__name__)
+
 
 def run_react_agent(agent_name: str, env, task: str, chaos: float = 0.0,
                     verbose: bool = True) -> dict:
+    """Run the ReAct agent; structured log lines are tagged with its name."""
+    with log.context(agent=agent_name):
+        logger.info("agent run start", mode="react", task=log.preview(task, 80),
+                    chaos=chaos or None)
+        stats = _run_react_agent(agent_name, env, task, chaos, verbose)
+        logger.info("agent run end", outcome=stats["outcome"], steps=stats["steps"],
+                    tokens=stats["tokens"], recalls=stats["recalls"],
+                    learns=stats["learns"], llm_errors=stats["llm_errors"] or None,
+                    unknown_tool_calls=stats["unknown_tool_calls"] or None,
+                    seconds=stats["seconds"])
+        return stats
+
+
+def _run_react_agent(agent_name: str, env, task: str, chaos: float,
+                     verbose: bool) -> dict:
     agent_id = memory.ensure_agent(agent_name)
     mem = MemoryTools(agent_id)
     tools = list(env.TOOLS) + MEMORY_TOOLS
@@ -138,4 +155,5 @@ def main():
 
 
 if __name__ == "__main__":
+    log.setup()
     main()

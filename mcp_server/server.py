@@ -19,8 +19,13 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
-from tributary import memory
+from tributary import log, memory
 from tributary.db import run_readonly
+
+# stdout is the MCP protocol channel: log.setup() only ever writes to stderr
+# (which MCP clients may not show; set TRIBUTARY_LOG_FILE to tail it instead).
+log.setup()
+log.set_defaults(agent=os.environ.get("TRIBUTARY_AGENT_NAME", "mcp-agent"))
 
 mcp = FastMCP("tributary")
 

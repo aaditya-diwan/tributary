@@ -7,9 +7,10 @@ Deployed on AWS App Runner via dashboard/Dockerfile.
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from tributary import memory, runs
+from tributary import log, memory, runs
 from tributary.db import run_txn
 
+log.setup()
 app = FastAPI(title="Tributary")
 
 

@@ -9,7 +9,10 @@ Logging is best-effort: it never raises into the caller (a metrics write must
 not break a learn), and it's skipped entirely offline or without a database.
 """
 
-from tributary import config
+from tributary import config, log
+
+logger = log.get_logger(__name__)
+_warned = False
 
 
 def log_call(purpose: str, model: str, usage: dict, cost_usd: float,
@@ -28,5 +31,10 @@ def log_call(purpose: str, model: str, usage: dict, cost_usd: float,
             )
 
         run_txn(txn)
-    except Exception:
-        pass  # metrics are never allowed to break the caller
+    except Exception as e:
+        # Metrics are never allowed to break the caller. Warn once (a missing
+        # llm_calls table would otherwise warn on every call), then debug.
+        global _warned
+        (logger.debug if _warned else logger.warning)(
+            "cost logging failed", error=log.preview(e, 200))
+        _warned = True

@@ -5,7 +5,9 @@ from pathlib import Path
 
 import psycopg
 
-from tributary import config
+from tributary import config, log
+
+logger = log.get_logger(__name__)
 
 RETRYABLE_SQLSTATE = "40001"  # serialization failure — Postgres asks the client to retry
 MAX_RETRIES = 5
@@ -48,18 +50,24 @@ def run_txn(fn, retries: int = MAX_RETRIES):
                     # conflict-safety guarantee — surface the count as a span
                     # attribute so it's visible in traces under contention.
                     sp.set_attribute("db.txn.attempts", attempt + 1)
+                    if attempt:
+                        logger.info("txn committed after serialization retries",
+                                    attempts=attempt + 1)
                     return result
-            except psycopg.errors.SerializationFailure as e:
-                last_err = e
-                time.sleep(0.05 * (2**attempt))  # brief backoff, then retry
             except psycopg.Error as e:
-                if getattr(e, "sqlstate", None) == RETRYABLE_SQLSTATE:
-                    last_err = e
-                    time.sleep(0.05 * (2**attempt))
-                else:
+                # SerializationFailure is the usual 40001; some drivers/paths
+                # surface it as a plain psycopg.Error with the same SQLSTATE.
+                if getattr(e, "sqlstate", None) != RETRYABLE_SQLSTATE:
                     raise
+                last_err = e
+                backoff = 0.05 * (2**attempt)
+                logger.warning("serialization conflict (40001), retrying",
+                               attempt=attempt + 1, of=retries,
+                               backoff_ms=int(backoff * 1000))
+                time.sleep(backoff)  # brief backoff, then retry
         sp.set_attribute("db.txn.attempts", retries)
         sp.set_attribute("db.txn.exhausted", True)
+    logger.error("txn gave up after serialization retries", attempts=retries)
     raise last_err
 
 

@@ -13,12 +13,15 @@ never garbage-collected, so forensics work months later, not just within a
 retention window.
 """
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from tributary import guard, llm, telemetry
+from tributary import guard, llm, log, telemetry
 from tributary.db import run_readonly, run_txn, vec_literal
 from tributary.embeddings import embed
+
+logger = log.get_logger(__name__)
 
 
 class PrivilegeError(PermissionError):
@@ -103,6 +106,20 @@ def _role(cur, agent_id: str) -> str:
 def recall(query: str, agent_id: str | None = None, k: int = 5,
            min_confidence: float = 0.3) -> list[Lesson]:
     """Semantic search over the tribe's active lessons."""
+    with log.context(op=log.new_op("recall")):
+        start = time.time()
+        hits = _recall_impl(query, agent_id, k, min_confidence)
+        logger.info("recall", query=log.preview(query, 80), hits=len(hits),
+                    top_distance=round(hits[0].distance, 3) if hits else None,
+                    ms=int((time.time() - start) * 1000))
+        for h in hits:
+            logger.debug("recall hit", lesson=h.id, distance=round(h.distance, 3),
+                         confidence=h.confidence, content=log.preview(h.content))
+        return hits
+
+
+def _recall_impl(query: str, agent_id: str | None, k: int,
+                 min_confidence: float) -> list[Lesson]:
     qvec = vec_literal(embed(query))
 
     def txn(cur):
@@ -207,10 +224,18 @@ def learn(content: str, situation: str, agent_id: str, evidence: str = "",
           task_id: str | None = None, confidence: float = 0.6,
           screen: bool = True) -> dict:
     """Write a lesson to shared memory (traced). See _learn_impl for details."""
-    with telemetry.span("memory.learn") as sp:
+    with log.context(op=log.new_op("learn")), telemetry.span("memory.learn") as sp:
+        start = time.time()
+        logger.debug("learn start", situation=log.preview(situation),
+                     content=log.preview(content))
         out = _learn_impl(content, situation, agent_id, evidence, task_id,
                           confidence, screen)
         sp.set_attribute("action", out["action"])
+        verdict = out.get("verdict") or {}
+        logger.info("learn", action=out["action"], lesson=out["lesson"].id,
+                    relation=verdict.get("relation"), target=verdict.get("target_id"),
+                    model=verdict.get("model"), escalated=verdict.get("escalated") or None,
+                    content=log.preview(content), ms=int((time.time() - start) * 1000))
         return out
 
 
@@ -237,6 +262,7 @@ def _learn_impl(content: str, situation: str, agent_id: str, evidence: str = "",
     role = run_readonly("SELECT role FROM agents WHERE id = %s", (agent_id,))
     role = role[0][0] if role else "reader"
     if role not in WRITE_ROLES:
+        logger.warning("learn blocked: role may not write", role=role, agent_id=agent_id)
         _audit_blocked(agent_id, "learn", f"role={role} may not write")
         raise PrivilegeError(f"agent role '{role}' is not permitted to write lessons")
 
@@ -245,6 +271,9 @@ def _learn_impl(content: str, situation: str, agent_id: str, evidence: str = "",
     if screen:
         screened = guard.screen_lesson(situation, content)
         if screened["verdict"] == "quarantine":
+            logger.warning("lesson quarantined by injection screen",
+                           reasons=screened["reasons"], screened_by=screened["screened_by"],
+                           content=log.preview(content))
             return _quarantine(content, situation, vec, agent_id, task_id,
                                evidence, screened["reasons"])
 
@@ -252,6 +281,8 @@ def _learn_impl(content: str, situation: str, agent_id: str, evidence: str = "",
     for attempt in range(MAX_CLASSIFY_ATTEMPTS):
         candidates = _fetch_candidates(vec)
         candidate_ids = tuple(sorted(c.id for c in candidates))
+        logger.debug("candidates", attempt=attempt + 1, count=len(candidates),
+                     distances=[round(c.distance, 3) for c in candidates])
 
         # Final attempt with a still-contended set: degrade to a safe
         # novel-insert rather than act on a verdict we can't validate.
@@ -272,7 +303,11 @@ def _learn_impl(content: str, situation: str, agent_id: str, evidence: str = "",
                 cur, content, situation, vec, agent_id, role, task_id, confidence,
                 evidence, verdict, candidate_ids))
         except _StaleCandidates:
-            continue  # candidate set moved; reclassify against the new view
+            # Candidate set moved under us (a concurrent learn committed);
+            # reclassify against the new view.
+            logger.info("candidates changed before commit; reclassifying",
+                        attempt=attempt + 1, of=MAX_CLASSIFY_ATTEMPTS)
+            continue
 
     # Unreachable in practice (last attempt forces novel), but keep it total.
     return run_txn(lambda cur: _apply_verdict(
@@ -433,6 +468,7 @@ def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confid
 
 def reinforce(lesson_id: str, agent_id: str | None = None) -> None:
     """Mark a recalled lesson as having actually helped."""
+    logger.info("reinforce", lesson=lesson_id)
 
     def txn(cur):
         cur.execute(
@@ -456,6 +492,7 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> Non
 
     def txn(cur):
         if agent_id is not None and _role(cur, agent_id) != "curator":
+            logger.warning("retire blocked: curator role required", lesson=lesson_id)
             cur.execute(
                 "INSERT INTO memory_audit (agent_id, action, detail) "
                 "VALUES (%s, 'blocked', %s)",
@@ -475,6 +512,7 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> Non
         )
 
     run_txn(txn)
+    logger.info("retire", lesson=lesson_id, reason=log.preview(reason) or None)
 
 
 def resolve_dispute(lesson_id: str, curator_id: str, accept: bool) -> dict:
@@ -507,4 +545,6 @@ def resolve_dispute(lesson_id: str, curator_id: str, accept: bool) -> dict:
             (curator_id, lesson_id))
         return {"action": "accepted", "lesson": lesson}
 
-    return run_txn(txn)
+    out = run_txn(txn)
+    logger.info("dispute resolved", lesson=lesson_id, action=out["action"])
+    return out

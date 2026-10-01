@@ -12,7 +12,14 @@ DECAY_AFTER_DAYS = 7
 DECAY_AMOUNT = 0.05
 RETIRE_BELOW = 0.2
 
+from tributary import log  # noqa: E402
 from tributary.db import run_txn  # noqa: E402
+
+# Lambda's runtime already configures the root logger; log.setup() sets
+# propagate=False on ours so each line is emitted once, not twice.
+log.setup()
+log.set_defaults(agent="gardener")
+logger = log.get_logger("gardener")
 
 
 def lambda_handler(event=None, context=None):
@@ -56,7 +63,7 @@ def lambda_handler(event=None, context=None):
         return {"decayed": len(decayed), "retired": len(retired)}
 
     result = run_txn(txn)
-    print(f"gardener: {result}")
+    logger.info("gardener pass", **result)
     return result
 
 

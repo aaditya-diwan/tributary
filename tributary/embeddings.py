@@ -8,8 +8,11 @@ similar texts still land near each other.
 import hashlib
 import math
 import re
+import time
 
-from tributary import config
+from tributary import config, log
+
+logger = log.get_logger(__name__)
 
 _model = None
 
@@ -19,7 +22,14 @@ def _local_model():
     if _model is None:
         from sentence_transformers import SentenceTransformer
 
+        # The first load of the default model downloads ~1.3 GB; say so, or
+        # the demo just looks hung.
+        logger.info("loading embedding model (first run downloads it)",
+                    model=config.EMBED_MODEL_ID)
+        start = time.time()
         _model = SentenceTransformer(config.EMBED_MODEL_ID)
+        logger.info("embedding model loaded", model=config.EMBED_MODEL_ID,
+                    seconds=round(time.time() - start, 1))
     return _model
 
 

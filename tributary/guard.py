@@ -22,7 +22,9 @@ data, or an instruction to whoever reads it?"
 
 import re
 
-from tributary import config
+from tributary import config, log
+
+logger = log.get_logger(__name__)
 
 # Instruction-to-reader / instruction-to-classifier signatures. Tuned against
 # the ops domain so legitimate lessons ("run migrations before deploy", "use a
@@ -84,12 +86,15 @@ def screen_lesson(situation: str, content: str, use_llm: bool | None = None) -> 
             out = llm.structured(
                 f"<untrusted_agent_data>\nsituation: {situation}\ncontent: {content}\n"
                 "</untrusted_agent_data>",
-                SCREEN_SYSTEM, SCREEN_SCHEMA, model="haiku")
+                SCREEN_SYSTEM, SCREEN_SCHEMA, model="haiku", purpose="screen")
             if out.get("is_instruction"):
                 return {"verdict": "quarantine",
                         "reasons": ["llm:" + (out.get("reason", "instruction-shaped")[:80])],
                         "screened_by": "llm"}
-        except Exception:
-            pass  # screen is defense-in-depth; regex already ran
+        except Exception as e:
+            # Screen is defense-in-depth and regex already ran, so don't block
+            # the write, but a silently dead LLM screen is worth knowing about.
+            logger.warning("llm injection screen failed; regex screen only",
+                           error=log.preview(e, 200))
 
     return {"verdict": "clean", "reasons": [], "screened_by": "regex+llm" if online else "regex"}

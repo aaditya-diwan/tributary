@@ -13,7 +13,9 @@ dependencies = [
 [project.optional-dependencies]
 embeddings = ["sentence-transformers>=3.0"]
 dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
-mcp = ["mcp>=1.6"]
+mcp = ["mcp>=1.6,<2"]
+openai = ["openai>=1.30"]
+jev = ["typesafe-sdk>=0.7"]
 otel = [
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-otlp-proto-http>=1.25",

@@ -19,7 +19,9 @@ import re
 import subprocess
 import time
 
-from tributary import config, costs, telemetry
+from tributary import config, costs, log, telemetry
+
+logger = log.get_logger(__name__)
 
 TIMEOUT_SECONDS = 120
 MAX_LLM_RETRIES = 2          # transient failures: timeout, non-zero exit, bad JSON
@@ -47,9 +49,13 @@ TOOL_LOOP_SCHEMA = {
 }
 
 
-def _run(prompt: str, system: str, json_schema: dict | None = None,
-         model: str | None = None) -> dict:
-    """Run `claude -p` headless and return the parsed --output-format json result."""
+class _Transient(Exception):
+    """A failure worth retrying: timeout, non-zero exit, bad JSON, API hiccup."""
+
+
+def _claude_once(prompt: str, system: str, json_schema: dict | None,
+                 model: str) -> dict:
+    """One headless `claude -p` call; returns the parsed --output-format json result."""
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
@@ -57,48 +63,145 @@ def _run(prompt: str, system: str, json_schema: dict | None = None,
         "--no-session-persistence",
         "--setting-sources", "",
         "--system-prompt", system,
-        "--model", model or config.CLAUDE_CODE_MODEL,
+        "--model", model,
     ]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        # Missing binary is a config error, not transient — don't retry.
+        raise LLMError(
+            "`claude` CLI not found on PATH — install Claude Code and log in "
+            "(claude auth) before running online, or set LLM_BACKEND=openai."
+        )
+    except subprocess.TimeoutExpired:
+        raise _Transient(f"timed out after {TIMEOUT_SECONDS}s")
+    if proc.returncode != 0:
+        raise _Transient(f"exit {proc.returncode}: {proc.stderr.strip()[:300]}")
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise _Transient(f"unparseable stdout: {proc.stdout[:200]!r}")
 
+
+# Callers pass Claude aliases in a few places (e.g. the injection screen asks
+# for "haiku"); on the openai backend those all mean the configured model.
+_CLAUDE_ALIASES = {"haiku", "sonnet", "opus"}
+_openai_client = None
+
+
+def _openai_once(prompt: str, system: str, json_schema: dict | None,
+                 model: str) -> dict:
+    """One OpenAI-compatible chat call (DeepSeek by default), returned in the
+    same shape `claude -p --output-format json` produces so callers don't care.
+
+    These APIs have JSON mode but not schema-constrained output, so the schema
+    goes into the system prompt and the reply is parsed and retried on failure.
+    The verdict whitelisting in `_parse_verdict` still applies either way.
+    """
+    global _openai_client
+    try:
+        import openai
+    except ImportError:
+        raise LLMError("LLM_BACKEND=openai needs the openai package: "
+                       "pip install -e \".[openai]\"")
+    if not config.LLM_API_KEY:
+        raise LLMError("LLM_BACKEND=openai needs LLM_API_KEY set (e.g. your DeepSeek key).")
+    if _openai_client is None:
+        _openai_client = openai.OpenAI(base_url=config.LLM_BASE_URL,
+                                       api_key=config.LLM_API_KEY,
+                                       timeout=TIMEOUT_SECONDS, max_retries=0)
+    if model in _CLAUDE_ALIASES:
+        model = config.LLM_MODEL
+
+    kwargs = {}
+    if json_schema:
+        system += ("\n\nRespond with ONLY a JSON object (no prose, no code fence) "
+                   "matching this JSON schema:\n" + json.dumps(json_schema))
+        kwargs["response_format"] = {"type": "json_object"}
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": prompt}],
+            **kwargs,
+        )
+    except (openai.AuthenticationError, openai.PermissionDeniedError,
+            openai.NotFoundError, openai.BadRequestError) as e:
+        raise LLMError(f"{config.LLM_BASE_URL} rejected the request: {e}")  # config, not transient
+    except openai.APIError as e:
+        raise _Transient(f"{type(e).__name__}: {str(e)[:300]}")
+
+    text = (resp.choices[0].message.content or "").strip()
+    usage = resp.usage
+    result = {
+        "result": text,
+        "session_id": resp.id or "0",
+        "usage": {"input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                  "output_tokens": getattr(usage, "completion_tokens", 0) or 0},
+        "total_cost_usd": 0.0,  # provider doesn't report it; tokens are still logged
+        "_model": getattr(resp, "model", None) or model,  # the model that answered
+    }
+    if json_schema:
+        try:
+            result["structured_output"] = json.loads(text)
+        except json.JSONDecodeError:
+            raise _Transient(f"reply was not JSON: {text[:200]!r}")
+    return result
+
+
+def _run(prompt: str, system: str, json_schema: dict | None = None,
+         model: str | None = None) -> dict:
+    """Run one LLM call on the configured backend, retrying transient failures.
+
+    Returns a dict shaped like `claude -p --output-format json`: `result`,
+    `structured_output` (when a schema was given), `usage`, `total_cost_usd`.
+    """
+    once = _openai_once if config.LLM_BACKEND == "openai" else _claude_once
+    model = model or config.CLAUDE_CODE_MODEL
+    logger.debug("llm request", backend=config.LLM_BACKEND, model=model,
+                 schema=bool(json_schema), prompt=log.preview(prompt, 300))
     last_err = None
     for attempt in range(MAX_LLM_RETRIES + 1):
         start = time.time()
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=TIMEOUT_SECONDS,
-            )
-        except FileNotFoundError:
-            # Missing binary is a config error, not transient — don't retry.
-            raise LLMError(
-                "`claude` CLI not found on PATH — install Claude Code and log in "
-                "(claude auth) before running online."
-            )
-        except subprocess.TimeoutExpired as e:
-            last_err = f"timed out after {TIMEOUT_SECONDS}s"
+            result = once(prompt, system, json_schema, model)
+        except _Transient as e:
+            last_err = str(e)
+            logger.warning("llm call failed, retrying" if attempt < MAX_LLM_RETRIES
+                           else "llm call failed", backend=config.LLM_BACKEND,
+                           model=model, attempt=attempt + 1, error=log.preview(e, 200))
         else:
-            if proc.returncode != 0:
-                last_err = f"exit {proc.returncode}: {proc.stderr.strip()[:300]}"
-            else:
-                try:
-                    result = json.loads(proc.stdout)
-                except json.JSONDecodeError:
-                    last_err = f"unparseable stdout: {proc.stdout[:200]!r}"
-                else:
-                    result["_elapsed_ms"] = int((time.time() - start) * 1000)
-                    return result
+            result["_elapsed_ms"] = int((time.time() - start) * 1000)
+            result["_attempts"] = attempt + 1
+            logger.debug("llm reply", model=model,
+                         reply=log.preview(result.get("structured_output")
+                                           or result.get("result", ""), 300))
+            return result
         if attempt < MAX_LLM_RETRIES:
             time.sleep(LLM_BACKOFF_SECONDS * (2**attempt))  # transient — back off and retry
-    raise LLMError(f"claude -p failed after {MAX_LLM_RETRIES + 1} attempts: {last_err}")
+    logger.error("llm call gave up", backend=config.LLM_BACKEND, model=model,
+                 attempts=MAX_LLM_RETRIES + 1, error=log.preview(last_err, 200))
+    raise LLMError(f"{config.LLM_BACKEND} LLM call failed after "
+                   f"{MAX_LLM_RETRIES + 1} attempts: {last_err}")
 
 
 def _log(result: dict, purpose: str, model: str, escalated: bool = False) -> None:
-    """Emit cost/latency for one call to llm_calls (best-effort)."""
-    costs.log_call(purpose, model, result.get("usage", {}),
-                   result.get("total_cost_usd", 0.0) or 0.0,
-                   result.get("_elapsed_ms", 0), escalated=escalated)
+    """Emit cost/latency for one call to llm_calls (best-effort) and the log."""
+    model = result.get("_model", model)
+    usage = result.get("usage", {})
+    cost = result.get("total_cost_usd", 0.0) or 0.0
+    ms = result.get("_elapsed_ms", 0)
+    logger.info("llm call", purpose=purpose, backend=config.LLM_BACKEND, model=model,
+                in_tokens=usage.get("input_tokens", 0),
+                out_tokens=usage.get("output_tokens", 0),
+                cost_usd=round(cost, 6), ms=ms, attempts=result.get("_attempts", 1),
+                escalated=escalated or None)
+    costs.log_call(purpose, model, usage, cost, ms, escalated=escalated)
 
 
 def complete(prompt: str, system: str | None = None, model: str | None = None,
@@ -266,19 +369,53 @@ def _parse_verdict(out: dict, existing: list[dict], model: str) -> dict:
             "confidence": float(confidence), "model": model}
 
 
+def _classify_once(model: str, new_situation: str, new_content: str,
+                   existing: list[dict], escalated: bool = False) -> dict:
+    """One classification on one tier: Jev (model == "jev") or an LLM."""
+    if model == "jev":
+        from tributary import jev
+        return jev.classify(new_situation, new_content, existing)
+    prompt = _classify_prompt(new_situation, new_content, existing)
+    purpose = "classify-escalated" if escalated else "classify"
+    used = model or config.CLAUDE_CODE_MODEL
+    with telemetry.span("llm.call", purpose=purpose, model=used) as sp:
+        result = _run(prompt, CLASSIFY_SYSTEM, json_schema=CLASSIFY_SCHEMA, model=used)
+        sp.set_attribute("escalated", escalated)
+    _log(result, purpose, used, escalated=escalated)
+    return _parse_verdict(result.get("structured_output") or {}, existing,
+                          result.get("_model", used))
+
+
+def _classify_or_degrade(model: str, new_situation: str, new_content: str,
+                         existing: list[dict], escalated: bool = False) -> dict:
+    """Like _classify_once, but a Jev outage yields a zero-confidence verdict
+    (which escalates) instead of failing the learn() that asked."""
+    from tributary import jev
+    try:
+        return _classify_once(model, new_situation, new_content, existing, escalated)
+    except jev.JevUnavailable:
+        return {"relation": "novel", "target_id": None, "confidence": 0.0,
+                "model": "jev-unavailable"}
+
+
 def classify_lesson(new_situation: str, new_content: str, existing: list[dict],
                     model: str | None = None) -> dict:
     """Classify a new lesson against similar existing ones, with model tiering.
 
-    The cheap model classifies first; if the verdict is a contradiction
+    The cheap tier classifies first; if the verdict is a contradiction
     (destructive — it would supersede a lesson) or its confidence is below
-    CLASSIFY_ESCALATE_BELOW, the call is re-run on the stronger model and that
-    verdict wins. Both calls are cost-logged; escalation is flagged.
+    CLASSIFY_ESCALATE_BELOW, the strong tier re-classifies and its verdict
+    wins. Both calls are cost-logged; escalation is flagged.
 
-    `existing` items: {"id": str, "situation": str, "content": str}. Uses the
-    CLI's constrained JSON output so untrusted lesson text cannot change the
-    verdict *shape* — only its values, which are whitelisted against the
-    candidate ids.
+    Either tier can be "jev" (TypeSafe's classification model, see jev.py) or
+    an LLM. CLASSIFY_MODEL_CHEAP=jev CLASSIFY_MODEL_STRONG=jev disables
+    escalation, which is how the eval harness measures Jev on its own. If Jev
+    is unavailable, its verdict degrades to zero confidence and escalates.
+
+    `existing` items: {"id": str, "situation": str, "content": str}. Output is
+    shape-constrained on every tier (Jev by construction, LLMs by schema), so
+    untrusted lesson text cannot change the verdict *shape*, only its values,
+    which are whitelisted against the candidate ids.
     """
     if not existing:
         return {"relation": "novel", "target_id": None, "confidence": 1.0,
@@ -288,35 +425,45 @@ def classify_lesson(new_situation: str, new_content: str, existing: list[dict],
         out.update(confidence=1.0, model="heuristic", escalated=False)
         return out
 
-    prompt = _classify_prompt(new_situation, new_content, existing)
     if model:  # explicit override skips tiering
-        verdict = _parse_verdict(
-            structured(prompt, CLASSIFY_SYSTEM, CLASSIFY_SCHEMA, model=model,
-                       purpose="classify"), existing, model)
+        verdict = _classify_or_degrade(model, new_situation, new_content, existing)
         verdict["escalated"] = False
+        logger.info("classified", tier="override", relation=verdict["relation"],
+                    target=verdict["target_id"], confidence=round(verdict["confidence"], 3),
+                    model=verdict["model"])
         return verdict
 
     cheap = config.CLASSIFY_MODEL_CHEAP
     with telemetry.span("llm.classify", model=cheap) as sp:
-        verdict = _parse_verdict(
-            structured(prompt, CLASSIFY_SYSTEM, CLASSIFY_SCHEMA, model=cheap,
-                       purpose="classify"), existing, cheap)
+        verdict = _classify_or_degrade(cheap, new_situation, new_content, existing)
         sp.set_attribute("relation", verdict["relation"])
         sp.set_attribute("confidence", verdict["confidence"])
 
-        needs_strong = (verdict["relation"] == "contradicts"
-                        or verdict["confidence"] < config.CLASSIFY_ESCALATE_BELOW)
+        reason = ("contradiction" if verdict["relation"] == "contradicts"
+                  else "low-confidence" if verdict["confidence"] < config.CLASSIFY_ESCALATE_BELOW
+                  else None)
         strong = config.CLASSIFY_MODEL_STRONG
-        if needs_strong and strong != cheap:
-            with telemetry.span("llm.call", purpose="classify-escalated", model=strong) as es:
-                result = _run(prompt, CLASSIFY_SYSTEM, json_schema=CLASSIFY_SCHEMA, model=strong)
-                es.set_attribute("escalated", True)
-            _log(result, "classify-escalated", strong, escalated=True)
-            verdict = _parse_verdict(result.get("structured_output") or {}, existing, strong)
+        logger.info("classified", tier="cheap", relation=verdict["relation"],
+                    target=verdict["target_id"], confidence=round(verdict["confidence"], 3),
+                    model=verdict["model"],
+                    escalate=(reason if strong != cheap else None))
+        if reason and strong != cheap:
+            cheap_verdict = verdict
+            verdict = _classify_or_degrade(strong, new_situation, new_content, existing,
+                                           escalated=True)
             verdict["escalated"] = True
             sp.set_attribute("escalated", True)
+            logger.info("classified", tier="strong", relation=verdict["relation"],
+                        target=verdict["target_id"],
+                        confidence=round(verdict["confidence"], 3), model=verdict["model"],
+                        overruled=(verdict["relation"] != cheap_verdict["relation"]
+                                   or verdict["target_id"] != cheap_verdict["target_id"])
+                        or None)
         else:
             verdict["escalated"] = False
+            if verdict["model"] == "jev-unavailable":
+                logger.error("jev unavailable and no other classifier tier; "
+                             "degrading to a novel insert")
     return verdict
 
 
@@ -339,7 +486,11 @@ def _heuristic_classify(situation: str, content: str, existing: list[dict]) -> d
 
 
 def is_available() -> bool:
-    """True if the `claude` CLI is on PATH (offline mode never needs it)."""
+    """True if the configured backend is usable (offline mode never needs one)."""
     import shutil
 
-    return config.OFFLINE or shutil.which("claude") is not None
+    if config.OFFLINE:
+        return True
+    if config.LLM_BACKEND == "openai":
+        return bool(config.LLM_API_KEY)
+    return shutil.which("claude") is not None

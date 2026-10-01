@@ -126,6 +126,33 @@ Six generations of fresh agents, task phrasing varied so recall has to work
 semantically. Tokens-per-task falls as the tribe's memory accumulates, the
 dashboard plots the curve. The species gets smarter.
 
+### Seeing what it's doing: logs
+
+Every layer logs structured events to **stderr** (never stdout, which the MCP
+server uses for the protocol). Each `learn()` / `recall()` gets an operation
+id, and agent runs tag lines with the agent's name, so one lesson can be
+followed from injection screen to classifier verdict to escalation to
+serializable retries to commit:
+
+```
+22:41:42.950 INFO    memory         [agent=agent-b op=recall-1c9e04aa] recall query="Deploy the payments service" hits=3 top_distance=0.214 ms=38
+22:41:42.986 INFO    jev            [agent=agent-b op=learn-eebbf96e] jev verdict model=jev-1.13.0 relation=contradicts target=… confidence=0.91 candidates=2 in_tokens=200 ms=131
+22:41:42.988 INFO    llm            [agent=agent-b op=learn-eebbf96e] classified tier=cheap relation=contradicts target=… confidence=0.91 model=jev-1.13.0 escalate=contradiction
+22:41:45.130 INFO    llm            [agent=agent-b op=learn-eebbf96e] classified tier=strong relation=contradicts target=… confidence=0.93 model=sonnet
+22:41:45.170 WARNING db             [agent=agent-b op=learn-eebbf96e] serialization conflict (40001), retrying attempt=1 of=5 backoff_ms=50
+22:41:45.236 INFO    memory         [agent=agent-b op=learn-eebbf96e] learn action=superseded lesson=… relation=contradicts model=sonnet escalated=true ms=2290
+```
+
+| variable | values |
+|---|---|
+| `TRIBUTARY_LOG_LEVEL` | `INFO` (default); `DEBUG` adds prompts, candidates, per-answer probabilities |
+| `TRIBUTARY_LOG_FORMAT` | `text` (default) or `json`, one object per line |
+| `TRIBUTARY_LOG_FILE` | also append JSON lines to this rotating file; use it for the MCP server, whose stderr most clients hide |
+
+Library code never configures logging itself; entrypoints (scripts, dashboard,
+MCP server, gardener, evals) call `tributary.log.setup()`. Lesson text is
+untrusted, so it's truncated in log fields; API keys are never logged.
+
 ### Tests & evals
 
 The conflict guarantees, the injection defense, and the agent's tool machinery
@@ -279,6 +306,18 @@ hallucinated tool name is fed back as an error rather than crashing the loop.
   confidence is below threshold. Verified: contradictions escalate, confident
   novels stay cheap. The eval harness is what lets you justify the routing with
   an accuracy-vs-cost number instead of a guess.
+- **Jev as the cheap tier (optional).** `CLASSIFY_MODEL_CHEAP=jev` routes the
+  first classification to TypeSafe's Jev, a classification-only model that
+  returns one of a fixed set of options with calibrated probabilities instead
+  of generated text (`tributary/jev.py`). Each candidate lesson gets its own
+  atomic Choice question (`same` / `conflicts` / `unrelated`), all in one
+  request; code folds the answers into a verdict, and Jev's confidence feeds
+  the same escalation threshold. Jev is weak at numbers and can be swayed by
+  adversarial text (TypeSafe documents both), so contradictions still escalate
+  to an LLM, and a Jev outage degrades to escalation rather than a failed
+  `learn`. Measure it alone with `CLASSIFY_MODEL_CHEAP=jev
+  CLASSIFY_MODEL_STRONG=jev python -m evals.run_eval --tier live --suite
+  classification` (equal tiers disable escalation). Not yet measured here.
 
 ## Design decisions & tradeoffs
 

@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS lessons (
 ALTER TABLE lessons ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ;
 ALTER TABLE lessons ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ;
 
+-- For a 'disputed' lesson: the active lesson it contradicts. Accepting the
+-- dispute supersedes that lesson; without the link, acceptance left both
+-- active (the split brain the conflict handling exists to prevent).
+ALTER TABLE lessons ADD COLUMN IF NOT EXISTS disputes UUID;
+
+-- Backfill disputes filed before the column existed, from their audit line
+-- ("contradicts <uuid> (curator review)"). Idempotent: only fills NULLs.
+UPDATE lessons l
+SET disputes = substring(a.detail from 'contradicts ([0-9a-f-]{36})')::uuid
+FROM memory_audit a
+WHERE l.status = 'disputed' AND l.disputes IS NULL
+  AND a.lesson_id = l.id AND a.action = 'dispute'
+  AND a.detail ~ 'contradicts [0-9a-f-]{36}';
+
 -- HNSW index with the cosine opclass, so `ORDER BY embedding <=> $q` is an
 -- approximate nearest-neighbour scan rather than a full table sort. It is
 -- PARTIAL over active lessons: an HNSW scan returns the ef_search nearest

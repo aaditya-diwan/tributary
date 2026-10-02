@@ -84,7 +84,9 @@ claude mcp add tributary \
 Now Alice's Claude Code session learns a gotcha (`tribal_learn`), and Bob's
 session, different machine, different repo, already knows it
 (`tribal_recall`). Tools exposed: `tribal_recall`, `tribal_learn`,
-`tribal_reinforce`, `tribal_retire`, `tribal_recall_as_of`, `tribal_stats`.
+`tribal_reinforce`, `tribal_retire`, `tribal_recall_as_of`, `tribal_stats`,
+plus curator tools `tribal_disputes`, `tribal_resolve_dispute` and
+`tribal_release`, and `tribal_report_mistake` for flagging a wrong verdict.
 
 ### Time-travel memory 🕰️
 
@@ -435,8 +437,9 @@ eval harness surfaced its own findings:
 - **A miscalibrated judge** (see above), caught precisely because the judge was
   calibrated against hand labels rather than trusted blind.
 
-What I'd do differently with more time: (1) resolve `disputed` lessons through
-the dashboard, not just the API; (2) grow the judge's labeled calibration set to
+What I'd do differently with more time: (1) resolve `disputed` lessons from
+the dashboard too (today it's the `tribal_disputes` / `tribal_resolve_dispute`
+MCP tools); (2) grow the judge's labeled calibration set to
 ~50 so its absolute scores become usable; (3) run the tiering accuracy-vs-cost
 sweep (haiku-only vs tiered vs sonnet-only) end-to-end and publish the curve,
 the harness supports it, I just haven't spent the tokens; (4) add embedding-drift

@@ -120,3 +120,95 @@ def test_reader_cannot_retire():
     lesson = memory.learn(f"Fact for {marker}", f"situation {marker}", writer)
     with pytest.raises(memory.PrivilegeError):
         memory.retire(lesson["lesson"].id, reader)
+    # The refusal is audited. (It used to be written inside the transaction
+    # the PrivilegeError rolled back, so it never persisted.)
+    blocked = run_readonly(
+        "SELECT detail FROM memory_audit WHERE agent_id = %s AND action = 'blocked'",
+        (reader,))
+    assert any(lesson["lesson"].id in d for (d,) in blocked)
+
+
+# --------------------------------------------------------------- disputes ---
+
+def _dispute(tag):
+    """Writer A's lesson, contradicted by writer B: filed as a dispute.
+
+    The offline classifier compares word overlap, so each call's wording is
+    mostly unique tokens: a lesson from another test (say, a challenger that
+    an earlier test activated) must not look like a duplicate of this one.
+    """
+    a = memory.ensure_agent("dsp-owner", role="writer")
+    b = memory.ensure_agent("dsp-challenger", role="writer")
+    w = [uuid.uuid4().hex[:6] for _ in range(3)]
+    sit = f"configuring {tag} {w[0]} {w[1]}"
+    first = memory.learn(f"{w[2]} uses protocol alpha", sit, a)
+    second = memory.learn(f"{w[2]} must use protocol beta instead", sit, b)
+    assert second["action"] == "disputed"
+    return first["lesson"].id, second["lesson"].id
+
+
+def _lesson_state(lid):
+    return run_readonly(
+        "SELECT status::TEXT, superseded_by::TEXT, activated_at IS NOT NULL, "
+        "deactivated_at IS NOT NULL FROM lessons WHERE id = %s", (lid,))[0]
+
+
+def test_dispute_records_which_lesson_it_challenges():
+    original, challenger = _dispute(uuid.uuid4().hex[:8])
+    assert run_readonly("SELECT disputes::TEXT FROM lessons WHERE id = %s",
+                        (challenger,))[0][0] == original
+    listed = {d["id"]: d for d in memory.disputes(limit=500)}
+    assert listed[challenger]["disputes"]["id"] == original
+
+
+def test_accepted_dispute_supersedes_the_challenged_lesson():
+    original, challenger = _dispute(uuid.uuid4().hex[:8])
+    curator = memory.ensure_agent("dsp-curator", role="curator")
+    out = memory.resolve_dispute(challenger, curator, accept=True)
+    assert out == {**out, "action": "accepted", "superseded": original}
+    # Exactly one belief survives, with provenance and a closed validity interval.
+    assert _lesson_state(original) == ("superseded", challenger, True, True)
+    assert _lesson_state(challenger) == ("active", None, True, False)
+
+
+def test_rejected_dispute_leaves_the_original_active():
+    original, challenger = _dispute(uuid.uuid4().hex[:8])
+    curator = memory.ensure_agent("dsp-curator", role="curator")
+    out = memory.resolve_dispute(challenger, curator, accept=False)
+    assert out["action"] == "rejected" and out["superseded"] is None
+    assert _lesson_state(original)[0] == "active"
+    assert _lesson_state(challenger) == ("retired", None, False, False)
+
+
+def test_accepting_a_dispute_whose_original_is_gone_just_activates():
+    original, challenger = _dispute(uuid.uuid4().hex[:8])
+    curator = memory.ensure_agent("dsp-curator", role="curator")
+    memory.retire(original, curator, reason="obsolete")
+    out = memory.resolve_dispute(challenger, curator, accept=True)
+    assert out["superseded"] is None
+    assert _lesson_state(original)[0] == "retired"
+    assert _lesson_state(challenger)[0] == "active"
+
+
+def test_resolving_a_dispute_is_curator_only_and_audited():
+    _, challenger = _dispute(uuid.uuid4().hex[:8])
+    writer = memory.ensure_agent("dsp-writer", role="writer")
+    with pytest.raises(memory.PrivilegeError):
+        memory.resolve_dispute(challenger, writer, accept=True)
+    assert _lesson_state(challenger)[0] == "disputed"
+    assert run_readonly(
+        "SELECT count(*) FROM memory_audit WHERE agent_id = %s AND action = 'blocked' "
+        "AND detail LIKE %s", (writer, f"%{challenger}%"))[0][0] == 1
+
+
+def test_schema_backfills_disputes_filed_before_the_column():
+    from tributary import db
+
+    original, challenger = _dispute(uuid.uuid4().hex[:8])
+
+    def forget(cur):
+        cur.execute("UPDATE lessons SET disputes = NULL WHERE id = %s", (challenger,))
+    run_txn(forget)
+    db.init_schema()  # idempotent; the backfill reads the dispute's audit line
+    assert run_readonly("SELECT disputes::TEXT FROM lessons WHERE id = %s",
+                        (challenger,))[0][0] == original

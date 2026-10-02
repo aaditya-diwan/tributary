@@ -124,6 +124,27 @@ def tribal_release(lesson_id: str, note: str = "") -> str:
 
 
 @mcp.tool()
+def tribal_disputes() -> str:
+    """List open disputes: lessons a writer filed that contradict another
+    agent's lesson, waiting for a curator. Each shows both sides."""
+    found = memory.disputes()
+    return json.dumps(found, indent=2) if found else "No open disputes."
+
+
+@mcp.tool()
+def tribal_resolve_dispute(lesson_id: str, accept: bool, note: str = "") -> str:
+    """Resolve a dispute (curators only). `lesson_id` is the disputed lesson
+    from tribal_disputes. accept=true makes it active and supersedes the
+    lesson it contradicts; accept=false retires it and the original stands."""
+    try:
+        out = memory.resolve_dispute(lesson_id, _me(), accept, note=note)
+    except (memory.PrivilegeError, ValueError) as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps({"action": out["action"], "lesson": _lesson_dict(out["lesson"]),
+                       "superseded": out["superseded"]}, indent=2)
+
+
+@mcp.tool()
 def tribal_report_mistake(decision_id: str, correct_relation: str,
                           correct_target_id: str = "", note: str = "") -> str:
     """Report that tribal_learn classified a lesson wrongly. `decision_id` is

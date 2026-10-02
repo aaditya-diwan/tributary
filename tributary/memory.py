@@ -98,12 +98,6 @@ def ensure_agent(name: str, role: str = "writer") -> str:
     return run_txn(txn)
 
 
-def _role(cur, agent_id: str) -> str:
-    cur.execute("SELECT role FROM agents WHERE id = %s", (agent_id,))
-    row = cur.fetchone()
-    return row[0] if row else "reader"
-
-
 def recall(query: str, agent_id: str | None = None, k: int = 5,
            min_confidence: float = 0.3) -> list[Lesson]:
     """Semantic search over the tribe's active lessons."""
@@ -340,6 +334,22 @@ def _quarantine(content, situation, vec, agent_id, task_id, evidence, reasons) -
     return run_txn(txn)
 
 
+def _require_curator(agent_id: str, action: str, detail: str) -> None:
+    """Raise PrivilegeError unless `agent_id` is a curator, auditing the refusal.
+
+    The check runs before the caller's transaction and the 'blocked' audit row
+    is written in its own. Written inside the caller's transaction, the row
+    would be rolled back by the very PrivilegeError that reports it, so
+    blocked attempts left no trace.
+    """
+    role = run_readonly("SELECT role FROM agents WHERE id = %s", (agent_id,))
+    if not role or role[0][0] != "curator":
+        logger.warning(f"{action} blocked: curator role required", detail=detail,
+                       role=role[0][0] if role else None)
+        _audit_blocked(agent_id, action, f"{detail}: curator role required")
+        raise PrivilegeError(f"{action} requires the curator role")
+
+
 def _audit_blocked(agent_id, action, detail) -> None:
     def txn(cur):
         cur.execute(
@@ -453,11 +463,12 @@ def _apply_verdict_inner(cur, content, situation, vec, agent_id, role, task_id, 
         cur.execute(
             f"""
             INSERT INTO lessons (content, situation, embedding, agent_id, task_id,
-                                 evidence, confidence, status)
-            VALUES (%s, %s, %s::vector, %s, %s, %s, %s, 'disputed')
+                                 evidence, confidence, status, disputes)
+            VALUES (%s, %s, %s::vector, %s, %s, %s, %s, 'disputed', %s)
             RETURNING {_LESSON_COLS}
             """,
-            (content, situation, vec, agent_id, task_id, evidence, confidence),
+            (content, situation, vec, agent_id, task_id, evidence, confidence,
+             verdict["target_id"]),
         )
         new = Lesson.from_row(cur.fetchone())
         cur.execute(
@@ -532,17 +543,12 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "",
 
     `injection=True` says the lesson was an injection the screen let through;
     it is queued as a golden screen case (an attack that should be blocked).
+    `agent_id=None` is the system itself (e.g. the gardener) and isn't checked.
     """
+    if agent_id is not None:
+        _require_curator(agent_id, "retire", f"retire {lesson_id}")
 
     def txn(cur):
-        if agent_id is not None and _role(cur, agent_id) != "curator":
-            logger.warning("retire blocked: curator role required", lesson=lesson_id)
-            cur.execute(
-                "INSERT INTO memory_audit (agent_id, action, detail) "
-                "VALUES (%s, 'blocked', %s)",
-                (agent_id, f"retire {lesson_id}: curator role required"),
-            )
-            raise PrivilegeError("retiring a lesson requires the curator role")
         cur.execute("SELECT status::TEXT, situation, content FROM lessons WHERE id = %s",
                     (lesson_id,))
         before = cur.fetchone()
@@ -572,39 +578,89 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "",
                        note=reason or None, reported_by=agent_id)
 
 
-def resolve_dispute(lesson_id: str, curator_id: str, accept: bool) -> dict:
-    """Curator resolves a disputed lesson: accept it (activate + supersede the
-    lesson it contradicted) or reject it (retire the challenger)."""
+def resolve_dispute(lesson_id: str, curator_id: str, accept: bool,
+                    note: str = "") -> dict:
+    """Curator resolves a disputed lesson.
+
+    Accept: the challenger becomes active and the lesson it disputes is
+    superseded by it, in one transaction, exactly like a contradiction a
+    curator learns directly (provenance chain, validity interval closed).
+    If that lesson is no longer active (retired or superseded meanwhile),
+    the challenger is simply activated. Reject: the challenger is retired and
+    the original stands.
+
+    Returns {"action": "accepted"|"rejected", "lesson", "superseded": id|None}.
+    """
+    _require_curator(curator_id, "resolve-dispute", f"resolve dispute {lesson_id}")
+
     def txn(cur):
-        if _role(cur, curator_id) != "curator":
-            raise PrivilegeError("resolving disputes requires the curator role")
         cur.execute(
-            f"SELECT {_LESSON_COLS} FROM lessons WHERE id = %s AND status = 'disputed'",
+            f"SELECT {_LESSON_COLS}, disputes::TEXT FROM lessons "
+            "WHERE id = %s AND status = 'disputed'",
             (lesson_id,),
         )
         row = cur.fetchone()
         if row is None:
             raise ValueError("no disputed lesson with that id")
-        lesson = Lesson.from_row(row)
+        lesson, target = Lesson.from_row(row[:7]), row[7]
         if not accept:
             cur.execute("UPDATE lessons SET status = 'retired' WHERE id = %s", (lesson_id,))
             cur.execute(
                 "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
-                "VALUES (%s, 'retire', %s, 'dispute rejected')", (curator_id, lesson_id))
-            return {"action": "rejected", "lesson": lesson}
-        # Accept: find the active lesson it contradicts and supersede it.
+                "VALUES (%s, 'retire', %s, %s)",
+                (curator_id, lesson_id, "dispute rejected" + (f": {note}" if note else "")))
+            return {"action": "rejected", "lesson": lesson, "superseded": None}
+
+        superseded = None
+        if target:
+            # WHERE status = 'active' makes this a no-op if someone retired or
+            # superseded the original in the meantime.
+            cur.execute(
+                "UPDATE lessons SET status = 'superseded', superseded_by = %s, "
+                "deactivated_at = now() WHERE id = %s AND status = 'active'",
+                (lesson_id, target))
+            if cur.rowcount:
+                superseded = target
+                cur.execute(
+                    "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
+                    "VALUES (%s, 'supersede', %s, %s)",
+                    (curator_id, target, f"superseded by {lesson_id} (dispute accepted)"))
         cur.execute(
             "UPDATE lessons SET status = 'active', activated_at = now() WHERE id = %s",
             (lesson_id,))
+        detail = ("activated by curator; " + (f"superseded {superseded}" if superseded
+                  else "the disputed lesson was no longer active"))
         cur.execute(
             "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
-            "VALUES (%s, 'dispute-accept', %s, 'activated by curator')",
-            (curator_id, lesson_id))
-        return {"action": "accepted", "lesson": lesson}
+            "VALUES (%s, 'dispute-accept', %s, %s)",
+            (curator_id, lesson_id, detail + (f"; {note}" if note else "")))
+        return {"action": "accepted", "lesson": lesson, "superseded": superseded}
 
     out = run_txn(txn)
-    logger.info("dispute resolved", lesson=lesson_id, action=out["action"])
+    logger.info("dispute resolved", lesson=lesson_id, action=out["action"],
+                superseded=out["superseded"])
     return out
+
+
+def disputes(limit: int = 50) -> list[dict]:
+    """Open disputes, oldest first: each challenger with the lesson it disputes."""
+    rows = run_readonly(
+        """
+        SELECT d.id::TEXT, d.situation, d.content, ad.name, d.created_at,
+               o.id::TEXT, o.content, ao.name, o.status::TEXT
+        FROM lessons d
+        JOIN agents ad ON ad.id = d.agent_id
+        LEFT JOIN lessons o ON o.id = d.disputes
+        LEFT JOIN agents ao ON ao.id = o.agent_id
+        WHERE d.status = 'disputed'
+        ORDER BY d.created_at
+        LIMIT %s
+        """, (limit,))
+    return [{"id": r[0], "situation": r[1], "content": r[2], "by": r[3],
+             "created_at": str(r[4]),
+             "disputes": {"id": r[5], "content": r[6], "by": r[7], "status": r[8]}
+             if r[5] else None}
+            for r in rows]
 
 
 def release(lesson_id: str, curator_id: str, note: str = "") -> dict:
@@ -621,10 +677,7 @@ def release(lesson_id: str, curator_id: str, note: str = "") -> dict:
     reader), the content is left in a retired row with a `release` audit
     line; re-learn it by hand from there.
     """
-    role = run_readonly("SELECT role FROM agents WHERE id = %s", (curator_id,))
-    if not role or role[0][0] != "curator":
-        _audit_blocked(curator_id, "release", f"{lesson_id}: curator role required")
-        raise PrivilegeError("releasing a quarantined lesson requires the curator role")
+    _require_curator(curator_id, "release", f"release {lesson_id}")
 
     def txn(cur):
         cur.execute(

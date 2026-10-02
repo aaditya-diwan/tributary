@@ -515,7 +515,14 @@ def main():
     os.environ["TRIBUTARY_GOLDEN_CAPTURE"] = "0"
 
     # Import after the offline env var is settled — config reads it at import.
-    from tributary import config
+    # Importing *anything* under tributary loads config, so no tributary
+    # import may run before this point (log.setup() included).
+    from tributary import config, log
+
+    log.setup()
+    if config.OFFLINE != (args.tier == "offline"):
+        sys.exit(f"tributary.config was imported before --tier {args.tier} set "
+                 "TRIBUTARY_OFFLINE; move that import below this point in main()")
 
     original_db_url = config.DATABASE_URL
     suites = args.suite or DEFAULT_SUITES[args.tier]
@@ -553,7 +560,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from tributary import log
-
-    log.setup()
     main()

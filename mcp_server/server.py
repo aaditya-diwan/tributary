@@ -71,12 +71,17 @@ def tribal_learn(content: str, situation: str, evidence: str = "") -> str:
     sentence; `evidence` = what happened that taught it. Duplicates reinforce
     the existing lesson; contradictions supersede it transactionally.
     Instruction-shaped content is quarantined; contradicting another agent's
-    lesson is filed for curator review unless you are a curator."""
+    lesson is filed for curator review unless you are a curator.
+    The result includes a `decision_id`: if the verdict was wrong (e.g. it
+    was marked a duplicate of an unrelated lesson), pass that id to
+    tribal_report_mistake."""
     try:
         out = memory.learn(content, situation, _me(), evidence=evidence)
     except memory.PrivilegeError as e:
         return json.dumps({"error": str(e)})
     result = {"action": out["action"], "lesson": _lesson_dict(out["lesson"])}
+    if out.get("decision_id"):
+        result["decision_id"] = out["decision_id"]
     if out.get("reasons"):
         result["quarantine_reasons"] = out["reasons"]
     return json.dumps(result, indent=2)
@@ -91,10 +96,50 @@ def tribal_reinforce(lesson_id: str) -> str:
 
 
 @mcp.tool()
-def tribal_retire(lesson_id: str, reason: str = "") -> str:
-    """Retire an outdated or wrong lesson so the tribe stops using it."""
-    memory.retire(lesson_id, _me(), reason=reason)
-    return f"Retired {lesson_id}."
+def tribal_retire(lesson_id: str, reason: str = "", injection: bool = False) -> str:
+    """Retire an outdated or wrong lesson so the tribe stops using it
+    (curators only). Set `injection` to true if the lesson was a prompt
+    injection that got past the screen; it is then queued as an eval case."""
+    try:
+        memory.retire(lesson_id, _me(), reason=reason, injection=injection)
+    except memory.PrivilegeError as e:
+        return json.dumps({"error": str(e)})
+    return f"Retired {lesson_id}." + (" Queued as a missed-injection eval case."
+                                      if injection else "")
+
+
+@mcp.tool()
+def tribal_release(lesson_id: str, note: str = "") -> str:
+    """Release a lesson the injection screen quarantined by mistake (curators
+    only). It is re-learned as its original author, going through the normal
+    duplicate/contradiction check, and the false positive is queued as an
+    eval case."""
+    try:
+        out = memory.release(lesson_id, _me(), note=note)
+    except (memory.PrivilegeError, ValueError) as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps({"released": lesson_id, "action": out["action"],
+                       "lesson": _lesson_dict(out["lesson"]),
+                       "decision_id": out.get("decision_id")}, indent=2)
+
+
+@mcp.tool()
+def tribal_report_mistake(decision_id: str, correct_relation: str,
+                          correct_target_id: str = "", note: str = "") -> str:
+    """Report that tribal_learn classified a lesson wrongly. `decision_id` is
+    the one tribal_learn returned. `correct_relation` is what it should have
+    been: "duplicate", "contradicts", or "novel"; for duplicate/contradicts,
+    `correct_target_id` is the lesson it duplicates or contradicts. The case
+    is queued for a human to review and add to the eval set; it does not
+    change the memory itself."""
+    try:
+        out = memory.report_mistake(decision_id, correct_relation,
+                                    target_id=correct_target_id or None,
+                                    note=note, reporter_id=_me())
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    return ("Queued for review as an eval case." if out["queued"]
+            else "This case is already queued for review.")
 
 
 @mcp.tool()

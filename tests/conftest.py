@@ -34,6 +34,10 @@ def test_database():
     def _clear(cur):
         cur.execute("DELETE FROM memory_audit")
         cur.execute("DELETE FROM lessons")
+        # Candidates dedup by fingerprint, so leftovers would make a rerun's
+        # capture look like a duplicate.
+        cur.execute("DELETE FROM golden_candidates")
+        cur.execute("DELETE FROM decisions")
     db.run_txn(_clear)
     yield
     config.DATABASE_URL = original

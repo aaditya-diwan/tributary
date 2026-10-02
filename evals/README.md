@@ -43,6 +43,11 @@ regression gate compares one key metric per suite against `evals/baseline.json`
   lessons wrongly blocked, currently 0.0). The full write-path enforcement
   (quarantine + recall exclusion + privilege separation + curator disputes)
   is covered by `tests/test_injection.py`.
+  Live tier only: `model_layer` scores the same set with regex off (regex
+  catches every attack in it, so otherwise the model layer is never tested),
+  and `live_set` scores `golden/redteam_live.jsonl`: attacks written to evade
+  the regex plus suspicious-sounding benign lessons. That file is live-only
+  because the offline gate scores regex alone.
 - **agent**, tool discipline for the ReAct agent (`agents/react_runner.py`),
   live-only. Runs the agent on an ops task (should call `tribal_recall`) and on
   a self-contained compute task (should NOT, there's nothing tribal to know).
@@ -75,3 +80,15 @@ regression gate compares one key metric per suite against `evals/baseline.json`
   exactly 0.8), and the pre-existing concurrent-conflict pytest passed
   vacuously in that case. The e2e suite now pins the unambiguous behavior;
   near-boundary phrasings are covered by golden classification cases instead.
+
+## Growing the golden sets from real failures
+
+Production mistakes are captured as candidates (`tributary/golden.py`):
+escalation overrules, `report_mistake` calls, injections retired by a
+curator, and lessons released from quarantine. `python -m evals.review`
+turns reviewed candidates into rows here, with ids `cap-cls-NN`,
+`cap-rt-NN` and `cap-live-NN`, `"difficulty": "unrated"`, and a `source`
+field naming the signal that found them. Accepting classification rows
+changes what the offline heuristic scores, so the command re-runs the
+offline classification gate and prints the `--update-baseline` command if
+the new number is expected. It never updates the baseline itself.

@@ -125,3 +125,47 @@ CREATE TABLE IF NOT EXISTS memory_audit (
 );
 
 CREATE INDEX IF NOT EXISTS memory_audit_at_idx ON memory_audit (at DESC);
+
+-- One row per classification decision in learn(): the new lesson, a snapshot
+-- of the candidate lessons it was judged against, and the verdict. Written in
+-- the same transaction as the lesson write, so it always matches what
+-- happened. It makes a later mistake report reproducible: a false "duplicate"
+-- leaves no lesson row of its own, and candidate lessons can change or be
+-- deleted afterwards.
+CREATE TABLE IF NOT EXISTS decisions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    op          TEXT,                  -- log correlation id, e.g. learn-3f2a9c1d
+    agent_id    UUID,
+    situation   TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    candidates  JSONB NOT NULL,        -- [{id, situation, content}] as classified
+    verdict     JSONB NOT NULL,        -- {relation, target_id, confidence, model, escalated}
+    action      TEXT NOT NULL,         -- inserted | reinforced | superseded | disputed
+    lesson_id   UUID,                  -- the lesson written or reinforced
+    at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS decisions_at_idx ON decisions (at DESC);
+
+-- Likely failures, queued for a human before they become golden eval rows
+-- (`python -m evals.review`). Labels from a model (an escalation overrule)
+-- need review as much as labels from people, so nothing is written to the
+-- golden files automatically. The fingerprint dedups repeats, such as an MCP
+-- client retrying the same call.
+CREATE TABLE IF NOT EXISTS golden_candidates (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind        TEXT NOT NULL,         -- classification | screen
+    source      TEXT NOT NULL,         -- escalation-overrule | retired-as-injection | released-from-quarantine | reported
+    fingerprint TEXT NOT NULL UNIQUE,
+    payload     JSONB NOT NULL,        -- inputs and proposed label, shaped like a golden row
+    got         JSONB,                 -- what the system decided
+    note        TEXT,
+    decision_id UUID,
+    reported_by UUID,
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending | accepted | rejected
+    golden_id   TEXT,                  -- id of the golden row it became
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS golden_candidates_status_idx ON golden_candidates (status, created_at);

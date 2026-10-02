@@ -366,19 +366,17 @@ def run_agent(tier: str, limit: int | None) -> dict:
     }
 
 
-def run_redteam(tier: str, limit: int | None) -> dict:
-    """Adversarial lesson-writes vs. the injection screen. Measures how many
-    attacks are blocked and, separately, the false-positive rate on benign
-    ops lessons — a screen that blocks everything is useless."""
-    from tributary import config, guard
+def _score_screen(cases: list[dict], label: str, verbose: bool, **screen_kwargs) -> dict:
+    """Block rate on attacks and false-positive rate on benign lessons for
+    one configuration of guard.screen_lesson."""
+    from tributary import guard
 
-    cases = load_jsonl(GOLDEN / "redteam.jsonl")[:limit]
     attacks = [c for c in cases if c["expect_blocked"]]
     benign = [c for c in cases if not c["expect_blocked"]]
     blocked_attacks, leaked, false_positives = 0, [], []
 
     for c in cases:
-        verdict = guard.screen_lesson(c["situation"], c["content"])
+        verdict = guard.screen_lesson(c["situation"], c["content"], **screen_kwargs)
         blocked = verdict["verdict"] == "quarantine"
         if c["expect_blocked"]:
             blocked_attacks += blocked
@@ -386,11 +384,11 @@ def run_redteam(tier: str, limit: int | None) -> dict:
                 leaked.append({"id": c["id"], "attack": c["attack"]})
         elif blocked:
             false_positives.append({"id": c["id"], "reasons": verdict["reasons"]})
-        if tier == "live":
-            print(f"  {c['id']} ({c['attack']}): "
+        if verbose:
+            print(f"  {label}{c['id']} ({c['attack']}): "
                   f"{'blocked' if blocked else 'PASSED THROUGH'} {verdict['reasons']}")
 
-    out = {
+    return {
         "attacks": len(attacks),
         "benign": len(benign),
         "block_rate": round(blocked_attacks / len(attacks), 3) if attacks else 1.0,
@@ -398,25 +396,37 @@ def run_redteam(tier: str, limit: int | None) -> dict:
         "leaked": leaked,
         "false_positives": false_positives,
     }
+
+
+def run_redteam(tier: str, limit: int | None) -> dict:
+    """Adversarial lesson-writes vs. the injection screen. Measures how many
+    attacks are blocked and, separately, the false-positive rate on benign
+    ops lessons — a screen that blocks everything is useless.
+
+    The top-level numbers are always redteam.jsonl through the full screen,
+    so history stays comparable (offline: regex only, which CI gates on).
+    The live tier adds two things:
+      model_layer  the same set with regex off. Regex catches every attack in
+                   redteam.jsonl, so without this the model layer is never tested.
+      live_set     redteam_live.jsonl: attacks the regex misses (by design,
+                   which is why they'd fail the regex-only CI gate) and tricky
+                   benign lessons, scored through the full screen and model-only.
+    """
+    from tributary import config
+
+    cases = load_jsonl(GOLDEN / "redteam.jsonl")[:limit]
+    out = _score_screen(cases, "", verbose=(tier == "live"))
     if tier == "live":
-        # The regex layer catches every attack in this set, so the numbers
-        # above never exercise the model layer. Score it alone as well.
-        model_blocked, model_fp = 0, []
-        for c in cases:
-            v = guard.screen_lesson(c["situation"], c["content"], use_llm=True, regex=False)
-            blocked = v["verdict"] == "quarantine"
-            if c["expect_blocked"]:
-                model_blocked += blocked
-            elif blocked:
-                model_fp.append({"id": c["id"], "reasons": v["reasons"]})
-            print(f"  model-only {c['id']}: {'blocked' if blocked else 'passed'} "
-                  f"{v['reasons']}")
-        out["model_layer"] = {
-            "screened_by": config.SCREEN_MODEL,
-            "block_rate": round(model_blocked / len(attacks), 3) if attacks else 1.0,
-            "false_positive_rate": round(len(model_fp) / len(benign), 3) if benign else 0.0,
-            "false_positives": model_fp,
-        }
+        out["model_layer"] = {"screened_by": config.SCREEN_MODEL, **_score_screen(
+            cases, "model-only ", True, use_llm=True, regex=False)}
+        live_path = GOLDEN / "redteam_live.jsonl"
+        if live_path.exists():
+            live = load_jsonl(live_path)[:limit]
+            out["live_set"] = {
+                "screen": _score_screen(live, "live ", True),
+                "model_layer": {"screened_by": config.SCREEN_MODEL, **_score_screen(
+                    live, "live model-only ", True, use_llm=True, regex=False)},
+            }
     return out
 
 
@@ -500,6 +510,9 @@ def main():
         os.environ["TRIBUTARY_OFFLINE"] = "1"
     else:
         os.environ.pop("TRIBUTARY_OFFLINE", None)
+    # Golden cases are already golden: a tiered live run escalates on them,
+    # and capturing those overrules would refill the review queue with copies.
+    os.environ["TRIBUTARY_GOLDEN_CAPTURE"] = "0"
 
     # Import after the offline env var is settled — config reads it at import.
     from tributary import config

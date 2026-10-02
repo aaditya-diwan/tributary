@@ -13,6 +13,7 @@ never garbage-collected, so forensics work months later, not just within a
 retention window.
 """
 
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -233,6 +234,7 @@ def learn(content: str, situation: str, agent_id: str, evidence: str = "",
         sp.set_attribute("action", out["action"])
         verdict = out.get("verdict") or {}
         logger.info("learn", action=out["action"], lesson=out["lesson"].id,
+                    decision=out.get("decision_id"),
                     relation=verdict.get("relation"), target=verdict.get("target_id"),
                     model=verdict.get("model"), escalated=verdict.get("escalated") or None,
                     content=log.preview(content), ms=int((time.time() - start) * 1000))
@@ -348,14 +350,50 @@ def _audit_blocked(agent_id, action, detail) -> None:
     run_txn(txn)
 
 
+_DECISION_FIELDS = ("relation", "target_id", "confidence", "model", "escalated")
+
+
 def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confidence,
                    evidence, verdict, classified_against: tuple) -> dict:
+    """Re-validate the classifier's view, apply the verdict, and record the
+    decision, all in one transaction.
+
+    The `decisions` row snapshots the candidate lessons the verdict was made
+    against. Writing it in the same transaction as the lesson write means it
+    can never describe something that didn't happen (a crash or a 40001 retry
+    rolls both back). Its id is returned as `decision_id`, the handle for
+    reporting a mistake later.
+    """
+    seen = {}
+    out = _apply_verdict_inner(cur, content, situation, vec, agent_id, role, task_id,
+                               confidence, evidence, verdict, classified_against, seen)
+    snapshot = [{"id": c.id, "situation": c.situation, "content": c.content}
+                for c in seen.get("candidates", [])]
+    applied = out.get("verdict") or verdict
+    cur.execute(
+        """
+        INSERT INTO decisions (op, agent_id, situation, content, candidates, verdict,
+                               action, lesson_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id::TEXT
+        """,
+        (log.bound("op"), agent_id, situation, content, json.dumps(snapshot),
+         json.dumps({k: applied.get(k) for k in _DECISION_FIELDS}),
+         out["action"], out["lesson"].id),
+    )
+    out["decision_id"] = cur.fetchone()[0]
+    return out
+
+
+def _apply_verdict_inner(cur, content, situation, vec, agent_id, role, task_id, confidence,
+                         evidence, verdict, classified_against: tuple, seen: dict) -> dict:
     """Re-validate the classifier's view, then apply the verdict atomically.
 
     `classified_against` is the candidate id set the verdict was computed on.
     If the current active candidate set differs, the verdict is stale and we
     bail out to reclassify. This is the guard that lets classification live
     outside the transaction without weakening serializable conflict safety.
+    The validated candidates are left in `seen` for the decision log.
     """
     cur.execute(
         f"""
@@ -374,6 +412,7 @@ def _apply_verdict(cur, content, situation, vec, agent_id, role, task_id, confid
     current_ids = tuple(sorted(c.id for c in current))
     if current_ids != classified_against:
         raise _StaleCandidates()
+    seen["candidates"] = current
 
     # 3a. Duplicate -> reinforce the existing lesson instead of inserting.
     if verdict["relation"] == "duplicate":
@@ -485,10 +524,15 @@ def reinforce(lesson_id: str, agent_id: str | None = None) -> None:
     run_txn(txn)
 
 
-def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> None:
+def retire(lesson_id: str, agent_id: str | None = None, reason: str = "",
+           injection: bool = False) -> None:
     """Retire a lesson. Curator-only — retiring shared knowledge is the most
     destructive write, so it needs the highest privilege. A human curating via
-    the MCP Server (TRIBUTARY_AGENT_ROLE=curator) qualifies."""
+    the MCP Server (TRIBUTARY_AGENT_ROLE=curator) qualifies.
+
+    `injection=True` says the lesson was an injection the screen let through;
+    it is queued as a golden screen case (an attack that should be blocked).
+    """
 
     def txn(cur):
         if agent_id is not None and _role(cur, agent_id) != "curator":
@@ -499,6 +543,9 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> Non
                 (agent_id, f"retire {lesson_id}: curator role required"),
             )
             raise PrivilegeError("retiring a lesson requires the curator role")
+        cur.execute("SELECT status::TEXT, situation, content FROM lessons WHERE id = %s",
+                    (lesson_id,))
+        before = cur.fetchone()
         cur.execute(
             "UPDATE lessons SET status = 'retired', "
             "deactivated_at = COALESCE(deactivated_at, CASE WHEN status = 'active' THEN now() END) "
@@ -510,9 +557,19 @@ def retire(lesson_id: str, agent_id: str | None = None, reason: str = "") -> Non
             "VALUES (%s, 'retire', %s, %s)",
             (agent_id, lesson_id, reason),
         )
+        return before
 
-    run_txn(txn)
-    logger.info("retire", lesson=lesson_id, reason=log.preview(reason) or None)
+    before = run_txn(txn)
+    logger.info("retire", lesson=lesson_id, reason=log.preview(reason) or None,
+                injection=injection or None)
+    # A quarantined lesson was already caught by the screen: not a miss.
+    if injection and before and before[0] != "quarantined":
+        from tributary import golden
+
+        golden.capture("screen", "retired-as-injection",
+                       golden.screen_payload(before[1], before[2], expect_blocked=True),
+                       got={"verdict": "clean", "status_before": before[0]},
+                       note=reason or None, reported_by=agent_id)
 
 
 def resolve_dispute(lesson_id: str, curator_id: str, accept: bool) -> dict:
@@ -548,3 +605,104 @@ def resolve_dispute(lesson_id: str, curator_id: str, accept: bool) -> dict:
     out = run_txn(txn)
     logger.info("dispute resolved", lesson=lesson_id, action=out["action"])
     return out
+
+
+def release(lesson_id: str, curator_id: str, note: str = "") -> dict:
+    """Curator releases a lesson the injection screen wrongly quarantined.
+
+    The quarantined row is retired (it was never active, so it never joins a
+    past belief set) and its content goes back through learn() as its
+    original author with the screen off: a person just cleared it, and it
+    still needs the duplicate/contradiction check that quarantine skipped.
+    The false positive is queued as a golden screen case.
+
+    Not atomic: the retire, the capture, and the re-learn are separate
+    transactions. If the re-learn fails (say the author was since demoted to
+    reader), the content is left in a retired row with a `release` audit
+    line; re-learn it by hand from there.
+    """
+    role = run_readonly("SELECT role FROM agents WHERE id = %s", (curator_id,))
+    if not role or role[0][0] != "curator":
+        _audit_blocked(curator_id, "release", f"{lesson_id}: curator role required")
+        raise PrivilegeError("releasing a quarantined lesson requires the curator role")
+
+    def txn(cur):
+        cur.execute(
+            "SELECT content, situation, agent_id::TEXT, evidence, task_id::TEXT "
+            "FROM lessons WHERE id = %s AND status = 'quarantined'", (lesson_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("no quarantined lesson with that id")
+        cur.execute(
+            "SELECT detail FROM memory_audit WHERE lesson_id = %s AND action = 'quarantine' "
+            "ORDER BY at DESC LIMIT 1", (lesson_id,))
+        detail = cur.fetchone()
+        cur.execute("UPDATE lessons SET status = 'retired' WHERE id = %s", (lesson_id,))
+        cur.execute(
+            "INSERT INTO memory_audit (agent_id, action, lesson_id, detail) "
+            "VALUES (%s, 'release', %s, %s)",
+            (curator_id, lesson_id, note or "released from quarantine by curator"))
+        return row, detail[0] if detail else None
+
+    (content, situation, author, evidence, task_id), screened = run_txn(txn)
+    logger.info("release", lesson=lesson_id, note=log.preview(note) or None)
+
+    from tributary import golden
+
+    golden.capture("screen", "released-from-quarantine",
+                   golden.screen_payload(situation, content, expect_blocked=False),
+                   got={"verdict": "quarantine", "detail": screened},
+                   note=note or None, reported_by=curator_id)
+    out = learn(content, situation, author, evidence=evidence or "", task_id=task_id,
+                screen=False)
+    out["released"] = lesson_id
+    return out
+
+
+def report_mistake(decision_id: str, relation: str, target_id: str | None = None,
+                   note: str = "", reporter_id: str | None = None) -> dict:
+    """Report that a learn() decision was classified wrongly, and what the
+    right answer was. Queues a golden classification case built from the
+    decision's snapshot, for review.
+
+    `decision_id` is the one learn() returned. `relation` is the correct
+    verdict (duplicate | contradicts | novel); `target_id` is the lesson it
+    duplicates or contradicts. If that lesson wasn't among the candidates the
+    classifier saw, it's added, and the case is noted as a retrieval miss.
+    """
+    if relation not in ("duplicate", "contradicts", "novel"):
+        raise ValueError("relation must be duplicate, contradicts, or novel")
+    if relation != "novel" and not target_id:
+        raise ValueError(f"a '{relation}' correction needs the target lesson id")
+    if relation == "novel":
+        target_id = None
+
+    rows = run_readonly(
+        "SELECT situation, content, candidates, verdict FROM decisions WHERE id::TEXT = %s",
+        (decision_id,))
+    if not rows:
+        raise ValueError("no decision with that id")
+    situation, content, candidates, verdict = rows[0]
+    if verdict.get("relation") == relation and verdict.get("target_id") == target_id:
+        raise ValueError("that is what the classifier already decided")
+
+    existing = list(candidates)
+    if target_id and target_id not in {e["id"] for e in existing}:
+        found = run_readonly("SELECT situation, content FROM lessons WHERE id::TEXT = %s",
+                             (target_id,))
+        if not found:
+            raise ValueError("no lesson with that target id")
+        existing.append({"id": target_id, "situation": found[0][0], "content": found[0][1]})
+        note = (f"{note} " if note else "") + (
+            "(the target was not among the retrieved candidates: a retrieval miss, "
+            "not only a classifier miss)")
+
+    from tributary import golden
+
+    cid = golden.capture(
+        "classification", "reported",
+        golden.classification_payload(situation, content, existing, relation, target_id),
+        got=verdict, note=note or None, decision_id=decision_id, reported_by=reporter_id)
+    logger.info("mistake reported", decision=decision_id, relation=relation,
+                queued=cid is not None)
+    return {"candidate_id": cid, "queued": cid is not None}

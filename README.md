@@ -153,6 +153,42 @@ Library code never configures logging itself; entrypoints (scripts, dashboard,
 MCP server, gardener, evals) call `tributary.log.setup()`. Lesson text is
 untrusted, so it's truncated in log fields; API keys are never logged.
 
+### Turning failures into eval cases
+
+Every mistake the system makes in real use can become a golden eval row, so
+the eval set grows from production rather than from guesses. Four signals
+queue a candidate in the `golden_candidates` table, with a snapshot of the
+inputs taken at the time:
+
+| signal | how it fires | what it says |
+|---|---|---|
+| escalation overrule | the strong classifier tier disagrees with the cheap one | the cheap tier misclassified (label from a model) |
+| reported mistake | `tribal_report_mistake(decision_id, ...)` / `memory.report_mistake` | a learn() verdict was wrong, and what it should have been |
+| retired as injection | `tribal_retire(..., injection=true)` | the screen let an attack through |
+| released from quarantine | `tribal_release` / `memory.release` (curators) | the screen blocked a real lesson |
+
+Every `learn()` records its decision (new lesson, candidate snapshot,
+verdict) in the `decisions` table, in the same transaction as the lesson
+write, and returns its `decision_id`. That's what makes a later report
+reproducible: a false duplicate leaves no lesson row of its own.
+
+Nothing reaches a golden file without review, because a model's label can be
+wrong and lesson text can hold secrets:
+
+```bash
+python -m evals.review           # go through the queue: accept / edit label / reject
+python -m evals.review --list
+python -m evals.review --accept 3f2a9c1d --relation novel
+```
+
+Accepted rows are routed so CI stays meaningful: classification cases go to
+`classification.jsonl`; screen cases go to `redteam.jsonl`, except attacks the
+regex layer misses, which go to `redteam_live.jsonl` (the offline gate is
+regex-only and would fail on them for doing their job). After accepting
+classification rows, the command shows the effect on the offline baseline;
+refreshing the baseline is left to you. Existing databases need
+`python scripts/init_db.py` once to create the two new tables.
+
 ### Tests & evals
 
 The conflict guarantees, the injection defense, and the agent's tool machinery

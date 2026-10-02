@@ -94,6 +94,11 @@ def set_defaults(**fields) -> None:
     _defaults.update(fields)
 
 
+def bound(field: str):
+    """The value of a bound context field (e.g. the current `op`), or None."""
+    return {**_defaults, **_context.get()}.get(field)
+
+
 def preview(text, limit: int = 120) -> str:
     """One-line, truncated rendering of untrusted text for a log field."""
     text = " ".join(str(text).split())

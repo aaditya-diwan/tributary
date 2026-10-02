@@ -456,12 +456,26 @@ def classify_lesson(new_situation: str, new_content: str, existing: list[dict],
                                            escalated=True)
             verdict["escalated"] = True
             sp.set_attribute("escalated", True)
+            overruled = (verdict["relation"] != cheap_verdict["relation"]
+                         or verdict["target_id"] != cheap_verdict["target_id"])
             logger.info("classified", tier="strong", relation=verdict["relation"],
                         target=verdict["target_id"],
                         confidence=round(verdict["confidence"], 3), model=verdict["model"],
-                        overruled=(verdict["relation"] != cheap_verdict["relation"]
-                                   or verdict["target_id"] != cheap_verdict["target_id"])
-                        or None)
+                        overruled=overruled or None)
+            # The strong tier disagreeing is the cheap tier's likely mistake.
+            # Queue it for review (the strong tier can be wrong too). A
+            # degraded verdict from an outage isn't a classification mistake.
+            degraded = "jev-unavailable" in (verdict["model"], cheap_verdict["model"])
+            if overruled and not degraded:
+                from tributary import golden
+
+                golden.capture(
+                    "classification", "escalation-overrule",
+                    golden.classification_payload(new_situation, new_content, existing,
+                                                  verdict["relation"], verdict["target_id"]),
+                    got={k: cheap_verdict.get(k)
+                         for k in ("relation", "target_id", "confidence", "model")},
+                    note=f"{verdict['model']} overruled {cheap_verdict['model']}")
         else:
             verdict["escalated"] = False
             if verdict["model"] == "jev-unavailable":

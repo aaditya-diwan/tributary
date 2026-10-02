@@ -183,6 +183,13 @@ python -m evals.review --list
 python -m evals.review --accept 3f2a9c1d --relation novel
 ```
 
+The dashboard shows the same loop: open disputes (accept / reject), recent
+classification decisions (report a mistake), the review queue (reject; accept
+stays in a checkout because it writes eval files), and quarantined lessons
+with the screen's reasons. It is read-only unless `DASHBOARD_CURATOR_TOKEN` is
+set; actions then need that token, entered in the page. Lesson text is
+untrusted, so the page escapes everything it renders.
+
 Accepted rows are routed so CI stays meaningful: classification cases go to
 `classification.jsonl`; screen cases go to `redteam.jsonl`, except attacks the
 regex layer misses, which go to `redteam_live.jsonl` (the offline gate is

@@ -10,6 +10,8 @@
           "PYTHONPATH": "D:/Preparation/tributary",
           "DATABASE_URL": "postgresql://postgres:postgres@localhost:5433/tributary_play",
           "TRIBUTARY_AGENT_NAME": "opencode",
+          "TRIBUTARY_AGENT_ROLE": "curator",
+          "SCREEN_MODEL": "jev",
           "CLASSIFY_MODEL_CHEAP": "jev",
           "TRIBUTARY_LOG_LEVEL": "DEBUG",
           "TRIBUTARY_LOG_FILE": "D:/Preparation/tributary/tributary-mcp.log"

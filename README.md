@@ -315,9 +315,26 @@ hallucinated tool name is fed back as an error rather than crashing the loop.
   the same escalation threshold. Jev is weak at numbers and can be swayed by
   adversarial text (TypeSafe documents both), so contradictions still escalate
   to an LLM, and a Jev outage degrades to escalation rather than a failed
-  `learn`. Measure it alone with `CLASSIFY_MODEL_CHEAP=jev
-  CLASSIFY_MODEL_STRONG=jev python -m evals.run_eval --tier live --suite
-  classification` (equal tiers disable escalation). Not yet measured here.
+  `learn`. Measured Jev-only on the 45-case golden set: strict accuracy
+  **1.00**, p50 **225 ms** per call (vs ~10 s for `claude -p`), about
+  $0.00002 per call.
+- **Jev as the injection screen (optional).** `SCREEN_MODEL=jev` replaces the
+  LLM second layer of the injection screen with five yes/no questions (override,
+  classifier-attack, reader-hijack, exfiltration, role-hijack) in one Jev call,
+  quarantining at p >= 0.70. Each question's "no" criterion spells out that
+  ordinary imperative ops advice doesn't count, since every lesson is phrased
+  that way. On 8 attacks written to evade the regex layer plus 12
+  suspicious-sounding benign lessons, each layer alone:
+
+  | layer | attacks caught | false positives | time for 20 lessons |
+  |---|---|---|---|
+  | regex | 0/8 | 1/12 | ~0 s |
+  | Claude haiku (`claude -p`) | 8/8 | 3/12 | 199 s |
+  | Jev | 8/8 | 1/12 | 5.5 s |
+
+  Small hand-written sets, so treat these as a sanity check, not a benchmark.
+  The live red-team eval now also scores the model layer with regex off
+  (`model_layer` in its output); Jev alone blocks 10/10 with 0/5 false positives.
 
 ## Design decisions & tradeoffs
 

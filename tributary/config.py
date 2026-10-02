@@ -43,6 +43,13 @@ TYPESAFE_API_KEY = os.environ.get("TYPESAFE_API_KEY", "")
 JEV_MODEL = os.environ.get("TYPESAFE_DEFAULT_MODEL", "jev-latest")
 JEV_USD_PER_MTOK = float(os.environ.get("JEV_USD_PER_MTOK", "0.042"))
 
+# Second layer of the injection screen (the regex layer always runs first):
+# "jev" asks Jev one yes/no question per hazard (~0.25 s); anything else is an
+# LLM model name (the original screen, ~10 s via `claude -p`). A Jev hazard
+# fires at p >= SCREEN_JEV_THRESHOLD (TypeSafe's guardrails cookbook "strict").
+SCREEN_MODEL = os.environ.get("SCREEN_MODEL", LLM_MODEL if _OPENAI else "haiku")
+SCREEN_JEV_THRESHOLD = float(os.environ.get("SCREEN_JEV_THRESHOLD", "0.70"))
+
 # Embeddings: local sentence-transformers model, 1024-d to match the
 # lessons.embedding VECTOR(1024) column without a schema migration.
 EMBED_MODEL_ID = os.environ.get("EMBED_MODEL_ID", "BAAI/bge-large-en-v1.5")

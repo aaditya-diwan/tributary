@@ -16,8 +16,9 @@ the system that stores it. Two things follow:
    `disputed` for review instead of silently deleting shared knowledge.
 
 The offline screen is pure regex (deterministic, CI-friendly). Online, a
-cheap model is asked the one question regex can't answer well: "is this text
-data, or an instruction to whoever reads it?"
+model is asked the one question regex can't answer well: "is this text data,
+or an instruction to whoever reads it?" That model is SCREEN_MODEL: Jev (one
+yes/no question per hazard, see jev.screen) or an LLM.
 """
 
 import re
@@ -69,32 +70,46 @@ SCREEN_SCHEMA = {
 }
 
 
-def screen_lesson(situation: str, content: str, use_llm: bool | None = None) -> dict:
+def screen_lesson(situation: str, content: str, use_llm: bool | None = None,
+                  regex: bool = True) -> dict:
     """Screen a candidate lesson for injection.
 
     Returns {"verdict": "clean"|"quarantine", "reasons": [...], "screened_by"}.
+    `use_llm` forces the model layer on or off (default: on unless offline);
+    `regex=False` skips the regex layer, which only the eval harness does, to
+    measure what the model layer catches on its own.
     """
-    text = f"{situation}\n{content}"
-    reasons = sorted({cat for cat, rx in _COMPILED if rx.search(text)})
-    if reasons:
-        return {"verdict": "quarantine", "reasons": reasons, "screened_by": "regex"}
+    if regex:
+        text = f"{situation}\n{content}"
+        reasons = sorted({cat for cat, rx in _COMPILED if rx.search(text)})
+        if reasons:
+            return {"verdict": "quarantine", "reasons": reasons, "screened_by": "regex"}
 
     online = (not config.OFFLINE) if use_llm is None else use_llm
+    layer = "jev" if config.SCREEN_MODEL == "jev" else "llm"
     if online:
-        from tributary import llm
         try:
-            out = llm.structured(
-                f"<untrusted_agent_data>\nsituation: {situation}\ncontent: {content}\n"
-                "</untrusted_agent_data>",
-                SCREEN_SYSTEM, SCREEN_SCHEMA, model="haiku", purpose="screen")
-            if out.get("is_instruction"):
-                return {"verdict": "quarantine",
-                        "reasons": ["llm:" + (out.get("reason", "instruction-shaped")[:80])],
-                        "screened_by": "llm"}
+            if layer == "jev":
+                from tributary import jev
+                fired = jev.screen(situation, content)["fired"]
+                if fired:
+                    return {"verdict": "quarantine", "reasons": ["jev:" + h for h in fired],
+                            "screened_by": "jev"}
+            else:
+                from tributary import llm
+                out = llm.structured(
+                    f"<untrusted_agent_data>\nsituation: {situation}\ncontent: {content}\n"
+                    "</untrusted_agent_data>",
+                    SCREEN_SYSTEM, SCREEN_SCHEMA, model=config.SCREEN_MODEL, purpose="screen")
+                if out.get("is_instruction"):
+                    return {"verdict": "quarantine",
+                            "reasons": ["llm:" + (out.get("reason", "instruction-shaped")[:80])],
+                            "screened_by": "llm"}
         except Exception as e:
             # Screen is defense-in-depth and regex already ran, so don't block
-            # the write, but a silently dead LLM screen is worth knowing about.
-            logger.warning("llm injection screen failed; regex screen only",
-                           error=log.preview(e, 200))
+            # the write, but a silently dead model screen is worth knowing about.
+            logger.warning("model injection screen failed; regex screen only",
+                           layer=layer, error=log.preview(e, 200))
 
-    return {"verdict": "clean", "reasons": [], "screened_by": "regex+llm" if online else "regex"}
+    layers = [n for n, on in (("regex", regex), (layer, online)) if on]
+    return {"verdict": "clean", "reasons": [], "screened_by": "+".join(layers)}

@@ -370,7 +370,7 @@ def run_redteam(tier: str, limit: int | None) -> dict:
     """Adversarial lesson-writes vs. the injection screen. Measures how many
     attacks are blocked and, separately, the false-positive rate on benign
     ops lessons — a screen that blocks everything is useless."""
-    from tributary import guard
+    from tributary import config, guard
 
     cases = load_jsonl(GOLDEN / "redteam.jsonl")[:limit]
     attacks = [c for c in cases if c["expect_blocked"]]
@@ -390,7 +390,7 @@ def run_redteam(tier: str, limit: int | None) -> dict:
             print(f"  {c['id']} ({c['attack']}): "
                   f"{'blocked' if blocked else 'PASSED THROUGH'} {verdict['reasons']}")
 
-    return {
+    out = {
         "attacks": len(attacks),
         "benign": len(benign),
         "block_rate": round(blocked_attacks / len(attacks), 3) if attacks else 1.0,
@@ -398,6 +398,26 @@ def run_redteam(tier: str, limit: int | None) -> dict:
         "leaked": leaked,
         "false_positives": false_positives,
     }
+    if tier == "live":
+        # The regex layer catches every attack in this set, so the numbers
+        # above never exercise the model layer. Score it alone as well.
+        model_blocked, model_fp = 0, []
+        for c in cases:
+            v = guard.screen_lesson(c["situation"], c["content"], use_llm=True, regex=False)
+            blocked = v["verdict"] == "quarantine"
+            if c["expect_blocked"]:
+                model_blocked += blocked
+            elif blocked:
+                model_fp.append({"id": c["id"], "reasons": v["reasons"]})
+            print(f"  model-only {c['id']}: {'blocked' if blocked else 'passed'} "
+                  f"{v['reasons']}")
+        out["model_layer"] = {
+            "screened_by": config.SCREEN_MODEL,
+            "block_rate": round(model_blocked / len(attacks), 3) if attacks else 1.0,
+            "false_positive_rate": round(len(model_fp) / len(benign), 3) if benign else 0.0,
+            "false_positives": model_fp,
+        }
+    return out
 
 
 SUITES = {

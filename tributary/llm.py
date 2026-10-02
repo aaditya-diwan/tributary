@@ -68,9 +68,12 @@ def _claude_once(prompt: str, system: str, json_schema: dict | None,
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
     try:
+        # stdin=DEVNULL: `claude -p` reads piped stdin as extra prompt input.
+        # Inside the MCP server, inherited stdin is the JSON-RPC pipe from the
+        # client, which never closes, so the call would block forever.
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=TIMEOUT_SECONDS,
+            errors="replace", timeout=TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
         # Missing binary is a config error, not transient — don't retry.

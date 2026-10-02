@@ -27,7 +27,10 @@ from tributary.db import run_readonly
 log.setup()
 log.set_defaults(agent=os.environ.get("TRIBUTARY_AGENT_NAME", "mcp-agent"))
 
-mcp = FastMCP("tributary")
+# FastMCP configures the *root* logger; at INFO that prints every httpx
+# request (e.g. HuggingFace model checks). Tributary's own events come from
+# log.setup() above, so keep the library's at WARNING.
+mcp = FastMCP("tributary", log_level="WARNING")
 
 _agent_id = None
 
@@ -129,4 +132,9 @@ def tribal_stats() -> str:
 
 
 if __name__ == "__main__":
+    # Load the embedding model while the client is still connecting; loaded
+    # lazily, the first tribal_learn/recall took ~50 s and clients timed out.
+    from tributary import embeddings
+
+    embeddings.warm_up()
     mcp.run()

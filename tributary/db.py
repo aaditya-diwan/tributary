@@ -71,6 +71,22 @@ def run_txn(fn, retries: int = MAX_RETRIES):
     raise last_err
 
 
+def run_read_committed(fn):
+    """Run `fn(cursor)` in one READ COMMITTED transaction.
+
+    Only for bookkeeping writes that don't need serializability, such as
+    usage counters (increments commute) and append-only audit rows. Nothing
+    here can raise 40001, so there is no retry loop; a caller that locks
+    several rows must lock them in a fixed order to avoid deadlocks.
+    """
+    with connect() as conn:
+        conn.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
+        with conn.cursor() as cur:
+            result = fn(cur)
+        conn.commit()
+        return result
+
+
 def run_readonly(sql: str, params=()) -> list[tuple]:
     """Run a single read-only statement on an autocommit connection.
 

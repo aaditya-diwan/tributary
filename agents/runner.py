@@ -145,8 +145,10 @@ def _distill_and_learn(agent_id, task, outcome, recalled, env):
     valid_ids = {l.id for l in recalled}
     for lid in distilled.get("helpful_lesson_ids", []):
         if lid in valid_ids:
-            memory.reinforce(lid, agent_id)
-            print(f"    reinforced: {lid}")
+            if memory.reinforce(lid, agent_id):
+                print(f"    reinforced: {lid}")
+            else:
+                print(f"    not reinforced (no longer active): {lid}")
 
 
 def main():

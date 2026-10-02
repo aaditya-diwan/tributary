@@ -17,6 +17,14 @@ CREATE TABLE IF NOT EXISTS agents (
 -- Privilege separation for existing databases created before the role column.
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'writer';
 
+-- The privilege checks compare against these exact strings, so a typo such
+-- as 'Curator' would silently demote an agent. Reject it at the source.
+DO $$ BEGIN
+    ALTER TABLE agents ADD CONSTRAINT agents_role_check
+        CHECK (role IN ('reader', 'writer', 'curator'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 -- 'quarantined' = failed the injection screen; 'disputed' = a writer challenged
 -- another agent's lesson and it awaits curator review. Neither is recalled or
 -- shown to the classifier, so poisoned/contested content can't spread.
@@ -35,7 +43,7 @@ CREATE TABLE IF NOT EXISTS lessons (
     situation      TEXT NOT NULL,            -- when it applies, e.g. "deploying via the internal deploy API"
     embedding      vector(1024) NOT NULL,    -- 1024-d embedding of situation + content
     agent_id       UUID NOT NULL REFERENCES agents(id),
-    task_id        UUID,
+    task_id        UUID,                     -- caller's correlation id; no tasks table
     evidence       TEXT,                     -- what happened that taught this (error message, etc.)
     confidence     DOUBLE PRECISION NOT NULL DEFAULT 0.6,
     times_recalled INT NOT NULL DEFAULT 0,
@@ -59,16 +67,48 @@ ALTER TABLE lessons ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ;
 -- For a 'disputed' lesson: the active lesson it contradicts. Accepting the
 -- dispute supersedes that lesson; without the link, acceptance left both
 -- active (the split brain the conflict handling exists to prevent).
+-- (Rows filed before this column existed are backfilled from the audit log
+-- further down, once memory_audit is guaranteed to exist.)
 ALTER TABLE lessons ADD COLUMN IF NOT EXISTS disputes UUID;
 
--- Backfill disputes filed before the column existed, from their audit line
--- ("contradicts <uuid> (curator review)"). Idempotent: only fills NULLs.
-UPDATE lessons l
-SET disputes = substring(a.detail from 'contradicts ([0-9a-f-]{36})')::uuid
-FROM memory_audit a
-WHERE l.status = 'disputed' AND l.disputes IS NULL
-  AND a.lesson_id = l.id AND a.action = 'dispute'
-  AND a.detail ~ 'contradicts [0-9a-f-]{36}';
+-- Backfill the belief interval for rows written before the temporal columns
+-- existed; without it they are invisible to time-travel reads. An active
+-- lesson has been believed since it was created. A superseded one was
+-- believed until its successor went active. Retired rows are left alone:
+-- nothing records whether they were ever active. Idempotent: only fills NULLs.
+UPDATE lessons SET activated_at = created_at
+WHERE status = 'active' AND activated_at IS NULL;
+
+UPDATE lessons s
+SET activated_at = COALESCE(s.activated_at, s.created_at),
+    deactivated_at = COALESCE(n.activated_at, n.created_at)
+FROM lessons n
+WHERE s.status = 'superseded' AND s.deactivated_at IS NULL
+  AND n.id = s.superseded_by;
+
+-- An active lesson must have an open belief interval. Time-travel reads
+-- trust these columns, so a write path that forgets them should fail loudly.
+DO $$ BEGIN
+    ALTER TABLE lessons ADD CONSTRAINT lessons_active_interval_check
+        CHECK (status <> 'active' OR (activated_at IS NOT NULL AND deactivated_at IS NULL));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- Lesson-to-lesson links. ON DELETE SET NULL keeps a bulk delete (the eval
+-- harness clears the table) from tripping over the chain. NOT VALID: new
+-- writes are checked, but a database holding a dangling id from before the
+-- constraint still initialises.
+DO $$ BEGIN
+    ALTER TABLE lessons ADD CONSTRAINT lessons_superseded_by_fkey
+        FOREIGN KEY (superseded_by) REFERENCES lessons(id) ON DELETE SET NULL NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE lessons ADD CONSTRAINT lessons_disputes_fkey
+        FOREIGN KEY (disputes) REFERENCES lessons(id) ON DELETE SET NULL NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 -- HNSW index with the cosine opclass, so `ORDER BY embedding <=> $q` is an
 -- approximate nearest-neighbour scan rather than a full table sort. It is
@@ -128,17 +168,37 @@ CREATE TABLE IF NOT EXISTS llm_calls (
 
 CREATE INDEX IF NOT EXISTS llm_calls_at_idx ON llm_calls (at DESC);
 
+-- agent_id and lesson_id are deliberately not foreign keys, here and in
+-- `decisions`: the audit trail has to outlive the rows it describes.
 CREATE TABLE IF NOT EXISTS memory_audit (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     agent_id   UUID,
     agent_name TEXT,
-    action     TEXT NOT NULL,     -- recall | learn | reinforce | supersede | retire | decay
+    -- recall | learn | reinforce | supersede | retire | decay | quarantine |
+    -- release | dispute | dispute-accept | blocked
+    action     TEXT NOT NULL,
     lesson_id  UUID,
     detail     TEXT,
     at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS memory_audit_at_idx ON memory_audit (at DESC);
+
+-- Per-lesson history lookups (release(), the dashboard's dispute view).
+CREATE INDEX IF NOT EXISTS memory_audit_lesson_idx ON memory_audit (lesson_id, action);
+
+-- Backfill disputes filed before lessons.disputes existed, from their audit
+-- line ("contradicts <uuid> (curator review)"). Idempotent: only fills NULLs.
+-- It must stay below CREATE TABLE memory_audit: on a fresh database the
+-- table doesn't exist until that statement runs. The join to `o` skips ids
+-- of lessons since deleted, which lessons_disputes_fkey would reject.
+UPDATE lessons l
+SET disputes = o.id
+FROM memory_audit a, lessons o
+WHERE l.status = 'disputed' AND l.disputes IS NULL
+  AND a.lesson_id = l.id AND a.action = 'dispute'
+  AND a.detail ~ 'contradicts [0-9a-f-]{36}'
+  AND o.id = substring(a.detail from 'contradicts ([0-9a-f-]{36})')::uuid;
 
 -- One row per classification decision in learn(): the new lesson, a snapshot
 -- of the candidate lessons it was judged against, and the verdict. Written in

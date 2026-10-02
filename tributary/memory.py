@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from tributary import guard, llm, log, telemetry
-from tributary.db import run_readonly, run_txn, vec_literal
+from tributary.db import run_read_committed, run_readonly, run_txn, vec_literal
 from tributary.embeddings import embed
 
 logger = log.get_logger(__name__)
@@ -116,33 +116,38 @@ def recall(query: str, agent_id: str | None = None, k: int = 5,
 def _recall_impl(query: str, agent_id: str | None, k: int,
                  min_confidence: float) -> list[Lesson]:
     qvec = vec_literal(embed(query))
+    rows = run_readonly(
+        f"""
+        SELECT {_LESSON_COLS}, embedding <=> %s::vector AS distance
+        FROM lessons
+        WHERE status = 'active' AND confidence >= %s
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
+        """,
+        (qvec, min_confidence, qvec, k),
+    )
+    ids = [r[0] for r in rows]
 
-    def txn(cur):
-        cur.execute(
-            f"""
-            SELECT {_LESSON_COLS}, embedding <=> %s::vector AS distance
-            FROM lessons
-            WHERE status = 'active' AND confidence >= %s
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
-            """,
-            (qvec, min_confidence, qvec, k),
-        )
-        rows = cur.fetchall()
-        ids = [r[0] for r in rows]
+    # Recall is a read; its usage counters are increments, which commute, so
+    # they don't need serializability. Writing them under SERIALIZABLE made
+    # every recall a read-write transaction that could fail with 40001 and
+    # force concurrent learn() calls to retry. Rows are locked in id order so
+    # two recalls with overlapping hits can't deadlock.
+    def bookkeeping(cur):
         if ids:
             cur.execute(
                 "UPDATE lessons SET times_recalled = times_recalled + 1, "
-                "last_used_at = now() WHERE id = ANY(%s)",
+                "last_used_at = now() WHERE id IN "
+                "(SELECT id FROM lessons WHERE id = ANY(%s) ORDER BY id FOR UPDATE)",
                 (ids,),
             )
         cur.execute(
             "INSERT INTO memory_audit (agent_id, action, detail) VALUES (%s, 'recall', %s)",
             (agent_id, f"{query[:200]} -> {len(rows)} hits"),
         )
-        return [Lesson.from_row(r) for r in rows]
 
-    return run_txn(txn)
+    run_read_committed(bookkeeping)
+    return [Lesson.from_row(r) for r in rows]
 
 
 def _parse_ts(timestamp: str | datetime) -> datetime:
@@ -516,23 +521,32 @@ def _apply_verdict_inner(cur, content, situation, vec, agent_id, role, task_id, 
     return {"action": action, "lesson": new, "verdict": verdict}
 
 
-def reinforce(lesson_id: str, agent_id: str | None = None) -> None:
-    """Mark a recalled lesson as having actually helped."""
-    logger.info("reinforce", lesson=lesson_id)
+def reinforce(lesson_id: str, agent_id: str | None = None) -> bool:
+    """Mark a recalled lesson as having actually helped.
 
+    Returns False, changing nothing, if the lesson is no longer active (it
+    was superseded or retired since it was recalled): raising a retired
+    lesson's confidence would mean nothing, and its audit row would mislead.
+    """
     def txn(cur):
         cur.execute(
             "UPDATE lessons SET times_helpful = times_helpful + 1, "
-            "confidence = LEAST(confidence + 0.05, 0.99) WHERE id = %s",
+            "confidence = LEAST(confidence + 0.05, 0.99) "
+            "WHERE id = %s AND status = 'active'",
             (lesson_id,),
         )
+        if not cur.rowcount:
+            return False
         cur.execute(
             "INSERT INTO memory_audit (agent_id, action, lesson_id) "
             "VALUES (%s, 'reinforce', %s)",
             (agent_id, lesson_id),
         )
+        return True
 
-    run_txn(txn)
+    applied = run_txn(txn)
+    logger.info("reinforce", lesson=lesson_id, applied=applied)
+    return applied
 
 
 def retire(lesson_id: str, agent_id: str | None = None, reason: str = "",

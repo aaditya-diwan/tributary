@@ -75,7 +75,8 @@ class MemoryTools:
             lid = args.get("lesson_id", "")
             if lid not in self.recalled_ids:
                 return f"Cannot reinforce {lid}: you did not recall that lesson this run."
-            memory.reinforce(lid, self.agent_id)
+            if not memory.reinforce(lid, self.agent_id):
+                return f"Lesson {lid} is no longer active; nothing reinforced."
             self.reinforced.add(lid)
             return f"Reinforced {lid}."
         return f"ERROR: unknown memory tool '{name}'"

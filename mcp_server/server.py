@@ -91,7 +91,8 @@ def tribal_learn(content: str, situation: str, evidence: str = "") -> str:
 def tribal_reinforce(lesson_id: str) -> str:
     """Mark a recalled lesson as having actually helped you. This raises its
     confidence so the tribe trusts it more."""
-    memory.reinforce(lesson_id, _me())
+    if not memory.reinforce(lesson_id, _me()):
+        return f"Lesson {lesson_id} is not active (superseded or retired); nothing reinforced."
     return f"Reinforced {lesson_id}."
 
 
